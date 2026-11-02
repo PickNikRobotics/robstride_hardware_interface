@@ -1,3 +1,4 @@
+# Modified by PickNik Inc., 2026: lifecycle/thermal/feedforward tests and notice installation.
 ################################################################################
 # Set minimum required version of cmake, project name and compile options
 ################################################################################
@@ -75,6 +76,8 @@ install(TARGETS ${PROJECT_NAME}
 install(DIRECTORY include/
   DESTINATION include
 )
+
+install(FILES LICENSE NOTICE README.md DESTINATION share/${PROJECT_NAME})
 
 install(PROGRAMS
   scripts/setup_can.sh

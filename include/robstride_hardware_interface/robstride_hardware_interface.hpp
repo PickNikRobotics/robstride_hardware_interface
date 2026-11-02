@@ -1,5 +1,7 @@
 // Copyright 2026 Minjo Kim
 // SPDX-License-Identifier: Apache-2.0
+// Modified by PickNik Inc., 2026: torque-retention lifecycle, thermal handoff,
+// and bounded motion-mode effort feedforward. See NOTICE for source history.
 
 #ifndef ROBSTRIDE_HARDWARE_INTERFACE__ROBSTRIDE_HARDWARE_INTERFACE_HPP_
 #define ROBSTRIDE_HARDWARE_INTERFACE__ROBSTRIDE_HARDWARE_INTERFACE_HPP_

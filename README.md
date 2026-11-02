@@ -1,8 +1,15 @@
 # robstride_hardware_interface
 
+<!-- Modified by PickNik Inc., 2026: fork setup, torque/thermal/feedforward contracts and source notices. -->
+
+This fork retains the current reBot torque, retry and thermal behavior and
+rebases bounded motion-mode feedforward onto it. See [NOTICE](NOTICE) for
+source revisions. Use the matching PickNik SDK: it decodes Type 0x15 fault
+words already; no driver-side byte-swap is needed.
+
 ## 1. Introduction
 
-A [ros2_control](https://github.com/ros-controls/ros2_control) `hardware_interface::SystemInterface` plugin for [RobStride](https://www.robstride.com/) CAN actuators (RS00–RS06), built on [robstride_sdk](https://github.com/kmj060703/RobstrideSDK) and [robstride_interfaces](https://github.com/kmj060703/robstride_interfaces).
+A [ros2_control](https://github.com/ros-controls/ros2_control) `hardware_interface::SystemInterface` plugin for [RobStride](https://www.robstride.com/) CAN actuators (RS00–RS06), built on [robstride_sdk](https://github.com/PickNikRobotics/RobstrideSDK) and [robstride_interfaces](https://github.com/kmj060703/robstride_interfaces).
 
 `read()` and `write()` never block on CAN I/O — they touch only the SDK's lock-free per-motor state and batch outgoing frames through `sendmmsg()`. The achievable update rate is therefore bounded by CAN bus bandwidth rather than by request/response round trips; see §10.
 
@@ -16,8 +23,10 @@ A [ros2_control](https://github.com/ros-controls/ros2_control) `hardware_interfa
 
 ```bash
 cd ~/${WORKSPACE}/src
-git clone https://github.com/kmj060703/RobstrideSDK.git
-git clone https://github.com/kmj060703/robstride_hardware_interface.git
+git clone https://github.com/PickNikRobotics/RobstrideSDK.git
+git clone https://github.com/PickNikRobotics/robstride_hardware_interface.git
+# Select the reviewed matching revisions from your workspace's submodule pins.
+# The fork default branches may not contain an unmerged integration branch.
 git clone https://github.com/kmj060703/robstride_interfaces.git
 
 cd ~/${WORKSPACE}
@@ -135,13 +144,16 @@ For a bench test without hardware, swap the `<hardware>` block for `mock_compone
 
 ## 6. Activation and joint loss
 
-### Activation never produces motion
+### Activation seeds targets from measured state
 
-Engaging torque may only ever mean "hold where you already are". The closed-loop modes keep their target inside the motor, in RAM that survives a deactivate/reactivate cycle, so enabling with a stale `loc_ref` still loaded would make the motor servo back to wherever it was last aimed. `on_activate()` therefore preloads every target before any torque exists:
+Activation is designed to engage torque at the measured position, not an old target.
+It is not a physical no-motion guarantee: the Stop probes below release torque,
+and a gravity-loaded arm without brakes can move or fall. Support it at its
+verified rest pose before activation, reactivation or a readable-but-limp start. The closed-loop modes keep their target inside the motor, in RAM that survives a deactivate/reactivate cycle, so enabling with a stale `loc_ref` still loaded would make the motor servo back to wherever it was last aimed. `on_activate()` therefore preloads every target before any torque exists:
 
 1. Open each bus and start its read thread.
 2. Arm each motor's `CAN_TIMEOUT` watchdog and select its `run_mode`.
-3. Send a Stop frame to every motor and wait for the reply. Stop is answered with the same Type-2 feedback as any other command, so this doubles as a position probe that cannot move anything — and it also clears any torque left on by a run that died before `on_deactivate`.
+3. Send a Stop frame to every motor and wait for the reply. Stop is answered with the same Type-2 feedback as any other command, so this doubles as a position probe that does not command a new target — but it releases torque, including torque left on by a run that died before `on_deactivate`.
 4. Preload each mode's target (`loc_ref` / `spd_ref` / `iq_ref`) from that measured position, and seed the command interfaces from the same reading.
 5. If `torque_enable` is `false`, stop here: the motors stay readable and free to move.
 6. Otherwise send Enable and wait up to `error_timeout_ms` for each motor to report `run_state == MOTOR`, resending every 200 ms since CAN frames are fire-and-forget.
@@ -196,7 +208,7 @@ A motor only knows its angle within one turn when it powers up, so after a power
 
 This recovers whole turns only. A mechanical zero the motor forgets across a power cycle shifts the reading by an arbitrary amount, and the wrapped value then looks plausible but is wrong. Make sure the zero is stored in the motor before relying on this.
 
-**Position feedback wraps at ±4π** — a firmware characteristic, not something this driver adds. See [robstride_sdk's README](https://github.com/kmj060703/RobstrideSDK/blob/main/README.md#5-actuator-models-and-limits) for what that means for continuously-rotating joints.
+**Position feedback wraps at ±4π** — a firmware characteristic, not something this driver adds. See [robstride_sdk's README](https://github.com/PickNikRobotics/RobstrideSDK/blob/main/README.md#5-actuator-models-and-limits) for what that means for continuously-rotating joints.
 
 ## 7. Services and active controllers
 
@@ -210,7 +222,12 @@ ros2 service call /robstride/robstride_hardware_interface/set_torque std_srvs/sr
 ros2 control switch_controllers --activate robstride_controller --controller-manager /robstride/controller_manager
 ```
 
-`joint_trajectory_controller` reads the measured position when it activates, so it resumes from wherever the joint actually ended up.
+Controller activation alone is not a general measured-pose anchor. In particular,
+MoveIt Pro's Joint Trajectory Admittance Controller can retain an earlier target.
+Use the robot configuration's measured-pose anchoring procedure before restoring
+spring gains; do not use this generic torque example as a reBot float/recovery
+procedure. Neither a service acknowledgement nor an accepted goal proves a motor
+has received a gain or reached a pose.
 
 `~/set_zero_robstride` is the more dangerous of the two, for a different reason. It moves nothing itself, but it redefines what zero means at the joint's current position. If a controller is holding a setpoint of, say, `3.0` at that moment, the physical spot that used to read `3.0` now reads `0.0`, and the controller — still chasing the literal number — drives the motor somewhere new to match. The motion comes entirely from the controller reacting to the reference frame shifting underneath it.
 
@@ -255,7 +272,8 @@ If utilization is near saturation, or staleness errors appear under load, reduce
 
 ## 11. License
 
-Apache License 2.0.
+Apache License 2.0. The unmodified [LICENSE](LICENSE) and attribution/history
+[NOTICE](NOTICE) are installed with the package.
 
 ## Thermal recovery handoff
 

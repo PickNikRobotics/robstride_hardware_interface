@@ -1,5 +1,6 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<!-- Modified by PickNik Inc., 2026: declare thermal notification and regression-test dependencies. -->
 <package format="3">
   <name>robstride_hardware_interface</name>
   <version>0.1.0</version>
