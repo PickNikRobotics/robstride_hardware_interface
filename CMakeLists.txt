@@ -85,6 +85,17 @@ install(PROGRAMS
 )
 
 if(BUILD_TESTING)
+  # Preserve the exact upstream license, including its appendix placeholders.
+  # ament_copyright only recognizes its own differently worded template.
+  file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" license_sha256)
+  if(NOT license_sha256 STREQUAL "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1")
+    message(FATAL_ERROR "LICENSE must remain byte-identical to the upstream Apache-2.0 license")
+  endif()
+  # Check every source directory explicitly: the default repository crawl adds
+  # LICENSE independently of --exclude and would require rewriting upstream text.
+  find_package(ament_cmake_copyright REQUIRED)
+  ament_copyright(include src test scripts CONTRIBUTING.md)
+  list(APPEND AMENT_LINT_AUTO_EXCLUDE ament_cmake_copyright)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 
