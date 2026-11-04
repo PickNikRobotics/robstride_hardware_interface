@@ -1,0 +1,27 @@
+robstride_hardware_interface
+
+Copyright 2026 Minjo Kim
+Licensed under the Apache License, Version 2.0; see LICENSE.
+The upstream LICENSE and source attribution are retained without alteration.
+
+Source: https://github.com/kmj060703/robstride_hardware_interface
+Fork history: https://github.com/griswaldbrooks/robstride_hardware_interface
+Maintained fork: https://github.com/PickNikRobotics/robstride_hardware_interface
+
+The PickNik fork retains the source history through
+c265ffd07d13c9c9ac7f860a14c82145d647ded0 (hold-torque-on-deactivate lineage),
+including torque retention, bounded re-enable attempts, joint-loss freezing,
+thermal latching and the verified-rest/cooling handoff.
+
+The motion-mode feedforward change from
+14d1edee0e780f1c0911f5d1ceb41e8775aa4c99 is applied on that newer lineage.
+Its functional source also appears in the integrated source snapshot at
+https://github.com/PickNikRobotics/moveit_pro_example_ws/commit/7d7761965e8082d169be39817ab3545c924e446c
+and is included only once. The earlier driver-side fault byte-swap is not
+included: the companion PickNik RobstrideSDK decodes fault words already.
+
+PickNik Inc. modifications (2026): hold-torque lifecycle and regression tests;
+thermal latching, recovery handoff and tests; bounded motion-mode effort
+feedforward and tests; fork-specific documentation and notice installation.
+Existing author attributions in the source files and Git history are retained.
+These notices do not change the license or claim physical qualification.

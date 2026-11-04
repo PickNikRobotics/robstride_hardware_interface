@@ -1,5 +1,20 @@
 // Copyright 2026 Minjo Kim
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Modified by PickNik Inc., 2026: torque-retention lifecycle, thermal handoff,
+// and bounded motion-mode effort feedforward. See NOTICE for source history.
 
 #include "robstride_hardware_interface/robstride_hardware_interface.hpp"
 
@@ -101,6 +116,22 @@ CallbackReturn RobstrideHardware::on_init(
   }
 
   try {
+    const auto cutoff = info_.hardware_parameters.find("thermal_cutoff_c");
+    const auto clear = info_.hardware_parameters.find("thermal_clear_c");
+    const double cutoff_c =
+      cutoff == info_.hardware_parameters.end() ? 0.0 : std::stod(cutoff->second);
+    const double clear_c =
+      clear == info_.hardware_parameters.end() ? 75.0 : std::stod(clear->second);
+    if (std::isfinite(cutoff_c) && std::isfinite(clear_c) &&
+      cutoff_c > 0.0 && clear_c >= cutoff_c)
+    {
+      RCLCPP_ERROR_STREAM(
+        logger_,
+        "thermal_clear_c (75 by default) must be below thermal_cutoff_c (" << cutoff_c <<
+          "); set thermal_clear_c in the hardware parameters to a lower value.");
+      return CallbackReturn::ERROR;
+    }
+    thermal_latch_.Configure(cutoff_c, clear_c);
     if (info_.hardware_parameters.count("master_id")) {
       master_id_ = static_cast<uint8_t>(std::stoi(info_.hardware_parameters.at("master_id")));
     }
@@ -121,10 +152,16 @@ CallbackReturn RobstrideHardware::on_init(
       const std::string & v = info_.hardware_parameters.at("torque_enable");
       torque_enabled_desired_.store(v == "true" || v == "True" || v == "1");
     }
+    if (info_.hardware_parameters.count("hold_torque_on_deactivate")) {
+      const std::string & v = info_.hardware_parameters.at("hold_torque_on_deactivate");
+      hold_torque_on_deactivate_ = v == "true" || v == "True" || v == "1";
+    }
   } catch (const std::exception & e) {
     RCLCPP_ERROR_STREAM(
       logger_,
-      "Malformed hardware parameter (master_id/error_timeout_ms/motor_can_timeout_ms): " << e.what());
+      "Malformed hardware parameter "
+      "(master_id/error_timeout_ms/motor_can_timeout_ms/thermal_cutoff_c/thermal_clear_c): " <<
+        e.what());
     return CallbackReturn::ERROR;
   }
   if (motor_can_timeout_ms_ <= 0.0) {
@@ -132,6 +169,17 @@ CallbackReturn RobstrideHardware::on_init(
       logger_,
       "Motor CAN watchdog disabled (motor_can_timeout_ms <= 0): if the bus dies, motors keep "
       "holding their last target until a clean shutdown or a power cut.");
+  }
+  // The two settings are coupled: deactivation closes the bus, so a motor
+  // whose own watchdog is still armed releases torque a short time after the
+  // frames stop regardless of what on_deactivate() chose not to send.
+  if (hold_torque_on_deactivate_ && motor_can_timeout_ms_ > 0.0) {
+    RCLCPP_WARN_STREAM(
+      logger_,
+      "hold_torque_on_deactivate is set but the motor CAN watchdog is armed at " <<
+        motor_can_timeout_ms_ << " ms, so each motor will release torque that long after "
+        "deactivation and the arm will drop. Set motor_can_timeout_ms to 0 to hold the pose "
+        "after a stop.");
   }
 
   const size_t n = info_.joints.size();
@@ -238,6 +286,13 @@ CallbackReturn RobstrideHardware::on_init(
       if (jh.direction != 1.0 && jh.direction != -1.0) {
         throw std::invalid_argument("direction must be 1 or -1");
       }
+      jh.max_feedforward_effort = std::stod(
+        GetJointParam(
+          *gpio, "max_feedforward_effort",
+          std::to_string(DefaultMaxFeedforwardEffort(jh.actuator_type))));
+      if (!(jh.max_feedforward_effort >= 0.0)) {
+        throw std::invalid_argument("max_feedforward_effort must be >= 0");
+      }
     } catch (const std::exception & e) {
       RCLCPP_ERROR_STREAM(logger_, "gpio '" << gpio->name << "': " << e.what());
       return CallbackReturn::ERROR;
@@ -302,6 +357,26 @@ CallbackReturn RobstrideHardware::on_init(
   state_pub_uni_ptr_->msg_.enabled.resize(n);
   state_pub_uni_ptr_->msg_.run_state.resize(n);
   state_pub_uni_ptr_->msg_.fault_bits.resize(n);
+
+  // Publish from the non-RT executor; read() only updates the atomic latch.
+  // Transient local also delivers a trip to a runtime that connects later.
+  thermal_pub_ = this->create_publisher<std_msgs::msg::Bool>(
+    "~/thermal_tripped", rclcpp::QoS(1).reliable().transient_local());
+  thermal_timer_ = this->create_wall_timer(std::chrono::milliseconds(100), [this]() {
+        std_msgs::msg::Bool message;
+        message.data = thermal_latch_.tripped();
+        thermal_pub_->publish(message);
+    });
+  thermal_samples_.resize(n);
+  thermal_clear_sub_ = this->create_subscription<std_msgs::msg::UInt64>(
+    "~/thermal_rest_verified", rclcpp::QoS(1).reliable(),
+    [this](std_msgs::msg::UInt64::ConstSharedPtr message) {
+      // This is a rest-pose attestation by the recovery owner, not a torque
+      // command. The RT loop owns the latch and revalidates every motor.
+      // The payload is the HOME measurement's same-host steady timestamp,
+      // not receipt time: stale or delayed attestations cannot authorize clear.
+      thermal_clear_request_ns_.store(message->data, std::memory_order_relaxed);
+    });
 
   get_data_srv_ = this->create_service<robstride_interfaces::srv::GetDataFromRobstride>(
     "~/get_data_from_robstride",
@@ -406,6 +481,12 @@ std::vector<hardware_interface::CommandInterface> RobstrideHardware::export_comm
 CallbackReturn RobstrideHardware::on_activate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
+  if (thermal_latch_.tripped()) {
+    RCLCPP_ERROR(logger_,
+      "Thermal trip latched; refusing activation. Recover at rest before restarting the driver.");
+    return CallbackReturn::ERROR;
+  }
+
   // Reactivation is the only way out of a freeze; see read().
   frozen_ = false;
   std::fill(seen_enabled_.begin(), seen_enabled_.end(), false);
@@ -499,6 +580,12 @@ CallbackReturn RobstrideHardware::on_activate(
     hw_cmd_position_[i] = hw_state_position_[i];
     hw_cmd_velocity_[i] = 0.0;
     hw_cmd_effort_[i] = 0.0;
+  }
+
+  UpdateThermalLatch();
+  if (thermal_latch_.tripped()) {
+    // All motors are still OFF after the probe. Never enable a hot arm.
+    torque_enabled_desired_.store(false, std::memory_order_relaxed);
   }
 
   // Activating without torque is a supported end state: the motors keep
@@ -604,10 +691,21 @@ CallbackReturn RobstrideHardware::on_deactivate(
 {
   is_active_ = false;
 
-  for (auto & jh : joints_) {
-    const auto it = buses_.find(jh.can_interface);
-    if (it != buses_.end()) {
-      it->second->SendFrame(jh.motor->EncodeDisable(false));
+  // Disabling torque is the right default for a rig that can rest unpowered,
+  // but it drops a gravity-loaded arm wherever it happens to be standing. With
+  // hold_torque_on_deactivate the motors keep their last target, so a stop
+  // holds the pose; nothing new is commanded either way.
+  if (hold_torque_on_deactivate_) {
+    RCLCPP_WARN(
+      logger_,
+      "Deactivating with torque engaged (hold_torque_on_deactivate=true): the joints stay "
+      "rigid at their current pose. Cut motor power to make the arm limp.");
+  } else {
+    for (auto & jh : joints_) {
+      const auto it = buses_.find(jh.can_interface);
+      if (it != buses_.end()) {
+        it->second->SendFrame(jh.motor->EncodeDisable(false));
+      }
     }
   }
   for (auto & kv : buses_) {
@@ -622,6 +720,7 @@ CallbackReturn RobstrideHardware::on_deactivate(
 return_type RobstrideHardware::read(
   const rclcpp::Time & time, const rclcpp::Duration & /*period*/)
 {
+  UpdateThermalLatch();
   bool any_fault = false;
   bool any_lost = false;
   std::string lost_joints;
@@ -671,7 +770,7 @@ return_type RobstrideHardware::read(
 
     const uint64_t last_ns = st.last_update_ns.load(std::memory_order_relaxed);
     const double elapsed_ms = ElapsedMsSinceUpdate(now_ns, last_ns);
-    const bool stale = elapsed_ms < 0.0 || elapsed_ms > error_timeout_ms_;
+    const bool stale = elapsed_ms<0.0 || elapsed_ms> error_timeout_ms_;
     if (stale || dropped_out) {
       any_lost = true;
       // Collected, not logged here: _THROTTLE suppresses per call site, so
@@ -771,7 +870,7 @@ return_type RobstrideHardware::write(
     }
 
     const bool currently_enabled = IsEnabled(st);
-    if (!currently_enabled && frozen_) {
+    if (!currently_enabled && (frozen_ || thermal_latch_.tripped())) {
       // A joint that dropped out stays limp until the hardware is
       // reactivated; re-enabling it here is what let a rebooted motor chase
       // a stale setpoint. The Stop frame keeps its feedback coming.
@@ -800,7 +899,7 @@ return_type RobstrideHardware::write(
 
     const uint64_t last_ns = st.last_update_ns.load(std::memory_order_relaxed);
     const double elapsed_ms = ElapsedMsSinceUpdate(now_ns, last_ns);
-    const bool stale = elapsed_ms < 0.0 || elapsed_ms > error_timeout_ms_;
+    const bool stale = elapsed_ms<0.0 || elapsed_ms> error_timeout_ms_;
     // fault_present is refreshed by every feedback frame and self-heals;
     // fault_bits stays latched with nothing to reset it, so it is not used.
     const bool faulted = st.fault_present.load(std::memory_order_relaxed);
@@ -841,7 +940,7 @@ return_type RobstrideHardware::write(
           static_cast<float>(target_velocity),
           static_cast<float>(hw_cmd_kp_[i]),
           static_cast<float>(hw_cmd_kd_[i]),
-          static_cast<float>(target_effort));
+          static_cast<float>(frozen_ ? 0.0 : MotorFeedforward(jh, hw_cmd_effort_[i])));
         break;
     }
     frames_by_bus[jh.can_interface].push_back(frame);
@@ -989,6 +1088,44 @@ void RobstrideHardware::SetZeroCallback(
   jh->motor->ResetPositionTracking();
 }
 
+void RobstrideHardware::UpdateThermalLatch()
+{
+  const bool was_tripped = thermal_latch_.tripped();
+  for (const auto & motor : motors_) {
+    const auto & state = motor->state();
+    if (state.last_update_ns.load(std::memory_order_relaxed) != 0) {
+      thermal_latch_.Observe(state.temperature.load(std::memory_order_relaxed));
+    }
+  }
+  if (!was_tripped && thermal_latch_.tripped()) {
+    RCLCPP_ERROR(logger_,
+      "Thermal cutoff reached: trip latched, torque retained for runtime rest-pose recovery; "
+      "automatic re-enable blocked");
+  }
+  const auto request_ns = thermal_clear_request_ns_.exchange(0, std::memory_order_relaxed);
+  const auto now_ns = robstride_sdk::NowNs();
+  if (request_ns == 0 || request_ns > now_ns || now_ns - request_ns >= 100'000'000ull ||
+    torque_enabled_desired_.load(std::memory_order_relaxed))
+  {
+    return;
+  }
+  for (size_t i = 0; i < motors_.size(); ++i) {
+    const auto & state = motors_[i]->state();
+    const auto stamp = state.last_feedback_ns.load(std::memory_order_acquire);
+    thermal_samples_[i] = {
+      state.temperature.load(std::memory_order_relaxed), stamp,
+      state.run_state.load(std::memory_order_relaxed) ==
+      static_cast<uint8_t>(robstride_sdk::RunState::RESET),
+      // Type-2 refreshes current health; detailed fault_bits retain history.
+      !state.fault_present.load(std::memory_order_relaxed)};
+  }
+  if (thermal_latch_.TryClear(thermal_samples_, now_ns)) {
+    RCLCPP_INFO(logger_,
+      "Thermal latch cleared after runtime rest verification and fresh cool OFF feedback; "
+      "torque remains OFF, explicit operator re-engagement required");
+  }
+}
+
 void RobstrideHardware::SetTorqueCallback(
   const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
   std::shared_ptr<std_srvs::srv::SetBool::Response> response)
@@ -996,6 +1133,12 @@ void RobstrideHardware::SetTorqueCallback(
   // Record the desired state only; write() sends the frames, so this does
   // not race with the RT loop. Deactivate any active controller before
   // disabling torque, or it keeps holding its setpoint (see README).
+  if (request->data && thermal_latch_.tripped()) {
+    response->success = false;
+    response->message =
+      "Thermal trip latched; no re-enable until successful rest/OFF recovery and cooling";
+    return;
+  }
   torque_enabled_desired_.store(request->data, std::memory_order_relaxed);
   response->success = true;
 }

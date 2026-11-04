@@ -1,9 +1,25 @@
 // Copyright 2026 Minjo Kim
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Modified by PickNik Inc., 2026: torque-retention lifecycle, thermal handoff,
+// and bounded motion-mode effort feedforward. See NOTICE for source history.
 
 #ifndef ROBSTRIDE_HARDWARE_INTERFACE__ROBSTRIDE_HARDWARE_INTERFACE_HPP_
 #define ROBSTRIDE_HARDWARE_INTERFACE__ROBSTRIDE_HARDWARE_INTERFACE_HPP_
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -30,6 +46,9 @@
 #include "robstride_interfaces/srv/set_zero_robstride.hpp"
 #include "robstride_interfaces/srv/reboot_robstride.hpp"
 #include "std_srvs/srv/set_bool.hpp"
+#include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/u_int64.hpp"
+#include "robstride_hardware_interface/thermal_latch.hpp"
 
 #include "realtime_tools/realtime_publisher.hpp"
 
@@ -53,8 +72,24 @@ struct JointHandle
   double wrap_center = 0.0;
   // No URDF position limits: targets take the shortest way round.
   bool continuous = false;
+  // Bound on the motion-mode torque feedforward (N*m, joint frame).
+  double max_feedforward_effort = 0.0;
   robstride_sdk::RobstrideMotor * motor;  // owned by RobstrideHardware::motors_
 };
+
+// A quarter of the model's MIT torque range: 3.5 N*m on an RS00 and 9 N*m on
+// an RS06, below their 5 and 11 N*m rated torque.
+inline double DefaultMaxFeedforwardEffort(robstride_sdk::ActuatorType type)
+{
+  return 0.25 * robstride_sdk::GetActuatorLimits(type).torque_max;
+}
+
+// Motor-frame torque feedforward for a joint-frame effort command.
+inline double MotorFeedforward(const JointHandle & jh, double joint_effort)
+{
+  return jh.direction *
+         std::clamp(joint_effort, -jh.max_feedforward_effort, jh.max_feedforward_effort);
+}
 
 // ros2_control SystemInterface for RobStride actuators over SocketCAN.
 // Owns one CanBus per distinct can_interface, so multi-bus rigs work.
@@ -82,6 +117,14 @@ public:
 
 private:
   rclcpp::Logger logger_;
+  ThermalLatch thermal_latch_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr thermal_pub_;
+  rclcpp::TimerBase::SharedPtr thermal_timer_;
+  void UpdateThermalLatch();
+  // Runtime attests fresh measured rest; read() rechecks cool/OFF before clear.
+  std::atomic<uint64_t> thermal_clear_request_ns_{0};
+  std::vector<ThermalSample> thermal_samples_;
+  rclcpp::Subscription<std_msgs::msg::UInt64>::SharedPtr thermal_clear_sub_;
 
   std::vector<JointHandle> joints_;
   std::unordered_map<std::string, std::unique_ptr<robstride_sdk::CanBus>> buses_;
@@ -118,6 +161,10 @@ private:
   // true: hold the remaining joints and ignore commands when one is lost.
   // false: return ERROR so the whole component is deactivated.
   bool freeze_on_joint_loss_ = true;
+  // true: on_deactivate() leaves torque engaged, so a clean stop holds the
+  // pose instead of dropping the arm. Only actually holds while the motor's
+  // own CAN_TIMEOUT watchdog is disabled; see on_init().
+  bool hold_torque_on_deactivate_ = false;
   // Latched on the first loss, cleared only by a fresh activation.
   bool frozen_ = false;
   // Positions held while frozen, captured at the moment of the loss.

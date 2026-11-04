@@ -1,5 +1,6 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<!-- Modified by PickNik Inc., 2026: declare thermal notification and regression-test dependencies. -->
 <package format="3">
   <name>robstride_hardware_interface</name>
   <version>0.1.0</version>
@@ -18,8 +19,11 @@
   <depend>realtime_tools</depend>
   <depend>robstride_sdk</depend>
   <depend>std_srvs</depend>
+  <depend>std_msgs</depend>
   <depend>robstride_interfaces</depend>
 
+  <test_depend>ament_cmake_copyright</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 
