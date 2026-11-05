@@ -159,7 +159,7 @@ verified rest pose before activation, reactivation or a readable-but-limp start.
 6. Otherwise send Enable and wait up to `error_timeout_ms` for each motor to report `run_state == MOTOR`, resending every 200 ms since CAN frames are fire-and-forget.
 7. If any joint never confirms, disable everything, tear down the buses and return `ERROR`.
 
-If a joint reports no position in step 3, activation is refused rather than engaging torque against an unknown target.
+If a joint reports no position in step 3, activation is refused rather than engaging torque against an unknown target. A status-only or truncated frame does not count as a position. With `torque_enable` `true`, activation is also refused, before any Enable frame, when a measured position (after the one-turn wrap below) lies outside that joint's URDF position limits by more than one Type-2 position quantum. With `torque_enable` `false` no Enable is sent, so the same check only logs an error naming the joint and the readable, limp activation still succeeds for commissioning. `~/set_torque` `true` is refused, with no Enable sent and a message naming the joint, while any measured position is outside its limits by that same margin. Activation never sends Set Zero: the measured position is used as reported.
 
 ### Losing a joint
 
@@ -237,9 +237,9 @@ All under the hardware component's own node namespace (`~`):
 
 | Name | Type | Description |
 |---|---|---|
-| `~/robstride_state` | `robstride_interfaces/msg/RobstrideState` | Per-joint id/enabled/run_state/fault_bits, published every `read()` cycle |
+| `~/robstride_state` | `robstride_interfaces/msg/RobstrideState` | Per-joint id/enabled/run_state/fault_bits, published every `read()` cycle. `comm_state` is `-1` only when some joint's feedback is older than `error_timeout_ms` (link loss), including while the component is inactive and its buses are closed; a motor fault shows in that joint's `fault_bits` with `comm_state` `0` |
 | `~/get_data_from_robstride` | `robstride_interfaces/srv/GetDataFromRobstride` | Read live telemetry for one motor |
-| `~/set_data_to_robstride` | `robstride_interfaces/srv/SetDataToRobstride` | Set `kp`/`kd`, or write an arbitrary parameter index |
+| `~/set_data_to_robstride` | `robstride_interfaces/srv/SetDataToRobstride` | Set `kp`/`kd`, or write an arbitrary parameter index. A `kp`/`kd` success means the gain was queued for the next motion frame, not that the motor applied it: motion-mode gains have no motor readback, and `get_data_from_robstride` returns `result: false` for them |
 | `~/set_zero_robstride` | `robstride_interfaces/srv/SetZeroRobstride` | Set a motor's mechanical zero |
 | `~/set_torque` | `std_srvs/srv/SetBool` | Enable/disable all configured motors |
 | `~/reboot_robstride` | `robstride_interfaces/srv/RebootRobstride` | Clear a motor's latched fault. Unconditional: the caller decides which faults are safe to clear. The joint re-enables only after the hardware is reactivated (see §6). |
@@ -270,7 +270,19 @@ canbusload can0@1000000 -r -t -b -e
 
 If utilization is near saturation, or staleness errors appear under load, reduce `update_rate` or the number of motors per bus. Leave headroom: a bus at 100% has no margin for retries, parameter writes, or momentary noise, and starts intermittently missing the `error_timeout_ms` deadline.
 
-## 11. License
+## 11. Virtual CAN qualification
+
+`test_fake_follower` drives the real lifecycle against seven fake RobStride motors (IDs 1–7, host 253) on a kernel `vcan` link: activation from measured state, out-of-bounds refusal, fault versus link loss, a silent joint and the latched freeze, failed and successful reactivation, the 100 °C latch, fault bit 14 under a static hold, gain write versus readback, transmit failure, truncated feedback, torque off, shutdown, position modes and the motor watchdog. `test_joint_coordinates` covers bounds, signs, whole-turn offsets and continuous wrap without CAN encoding. The fake is an independent wire implementation and is not a thermal, load or friction model.
+
+The tests open only a link whose kernel kind is `vcan`; a physical interface renamed `vcan0` is refused. `test/with_vcan.py` creates and removes the link and sets `ROBSTRIDE_REQUIRE_VCAN=1`, so a missing link fails instead of skipping. Run it in a separate network namespace with `CAP_NET_ADMIN`, for example a container started with `--network none --cap-add NET_ADMIN`:
+
+```bash
+python3 test/with_vcan.py -- colcon test --packages-select robstride_hardware_interface
+```
+
+Without a `vcan` link and without `ROBSTRIDE_REQUIRE_VCAN`, the CAN tests skip. `fake_robstride_motor.hpp` and `with_vcan.py` are installed under `share/robstride_hardware_interface/test` for downstream integration tests.
+
+## 12. License
 
 Apache License 2.0. The unmodified [LICENSE](LICENSE) and attribution/history
 [NOTICE](NOTICE) are installed with the package.

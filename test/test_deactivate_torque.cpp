@@ -19,11 +19,10 @@
 // against a fake motor on a virtual CAN interface, so nothing here needs an
 // arm, a CAN adapter, or a power supply.
 //
-// Needs a vcan interface (NET_ADMIN, which the MoveIt Pro dev container has):
-//   sudo modprobe vcan
-//   sudo ip link add dev vcan0 type vcan && sudo ip link set vcan0 up
-// Without one the test skips rather than failing, so it cannot be mistaken
-// for coverage it did not provide.
+// Needs a kernel vcan link. test/with_vcan.py creates one in an isolated
+// network namespace with CAP_NET_ADMIN and sets ROBSTRIDE_REQUIRE_VCAN, which
+// turns a missing link into a failure. Without either the test skips, so it
+// cannot be mistaken for coverage it did not provide.
 
 #include <gtest/gtest.h>
 #include <net/if.h>
@@ -143,9 +142,12 @@ class DeactivateTorqueTest : public testing::Test
 protected:
   void SetUp() override
   {
-    if (::if_nametoindex(TestInterface()) == 0) {
-      GTEST_SKIP() << "no '" << TestInterface() <<
-        "' interface; see the header comment for how to create one";
+    if (!robstride_test::IsVirtualCan(TestInterface())) {
+      if (std::getenv("ROBSTRIDE_REQUIRE_VCAN")) {
+        FAIL() << "qualification requires a kernel vcan link";
+      }
+      GTEST_SKIP() << "no virtual '" << TestInterface() <<
+        "' interface; run test/with_vcan.py in an isolated network namespace";
     }
   }
 

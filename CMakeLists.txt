@@ -109,6 +109,16 @@ if(BUILD_TESTING)
   target_link_libraries(test_deactivate_torque ${PROJECT_NAME})
   ament_add_gtest(test_feedforward test/test_feedforward.cpp)
   target_link_libraries(test_feedforward ${PROJECT_NAME})
+  ament_add_gtest(test_fake_follower test/test_fake_follower.cpp TIMEOUT 90)
+  target_include_directories(test_fake_follower PRIVATE test)
+  target_link_libraries(test_fake_follower ${PROJECT_NAME})
+  ament_add_gtest(test_joint_coordinates test/test_joint_coordinates.cpp)
+  target_link_libraries(test_joint_coordinates ${PROJECT_NAME})
+  set_tests_properties(test_deactivate_torque test_fake_follower PROPERTIES
+    RESOURCE_LOCK robstride_vcan)
+  # Shared fixture for downstream workspace tests, never part of runtime headers.
+  install(FILES test/fake_robstride_motor.hpp test/with_vcan.py
+    DESTINATION share/${PROJECT_NAME}/test)
 endif()
 
 ################################################################################

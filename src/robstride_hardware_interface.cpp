@@ -14,7 +14,8 @@
 // limitations under the License.
 //
 // Modified by PickNik Inc., 2026: torque-retention lifecycle, thermal handoff,
-// and bounded motion-mode effort feedforward. See NOTICE for source history.
+// bounded motion-mode effort feedforward, activation bounds and link-only
+// comm_state. See NOTICE for source history.
 
 #include "robstride_hardware_interface/robstride_hardware_interface.hpp"
 
@@ -26,6 +27,8 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+
+#include "robstride_hardware_interface/joint_coordinates.hpp"
 
 namespace robstride_hardware_interface
 {
@@ -41,10 +44,13 @@ RobstrideHardware::RobstrideHardware()
 
 RobstrideHardware::~RobstrideHardware()
 {
-  if (service_executor_) {
-    service_executor_->cancel();
-  }
   if (service_executor_thread_.joinable()) {
+    // A cancel() that lands before spin() starts is lost, so repeat it until
+    // spin() returns. Destroying the component right after on_init() hung here.
+    while (!service_executor_stopped_.load()) {
+      service_executor_->cancel();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     service_executor_thread_.join();
   }
   for (auto & kv : buses_) {
@@ -94,12 +100,6 @@ uint32_t CanTimeoutRaw(double timeout_ms)
 }
 
 constexpr double kTwoPi = 2.0 * M_PI;
-
-// Map x into [center - pi, center + pi).
-double WrapToWindow(double x, double center)
-{
-  return x - kTwoPi * std::floor((x - center + M_PI) / kTwoPi);
-}
 
 bool IsEnabled(const robstride_sdk::MotorState & st)
 {
@@ -401,7 +401,11 @@ CallbackReturn RobstrideHardware::on_init(
       std::placeholders::_2));
   service_executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
   service_executor_->add_node(this->get_node_base_interface());
-  service_executor_thread_ = std::thread([this]() {service_executor_->spin();});
+  service_executor_thread_ = std::thread(
+    [this]() {
+      service_executor_->spin();
+      service_executor_stopped_ = true;
+    });
 
   RCLCPP_INFO_STREAM(
     logger_,
@@ -524,11 +528,23 @@ CallbackReturn RobstrideHardware::on_activate(
     buses_[jh.can_interface]->SendFrame(jh.motor->EncodeDisable(false));
   }
 
+  auto abort_activation = [this]() {
+      for (auto & jh : joints_) {
+        buses_[jh.can_interface]->SendFrame(jh.motor->EncodeDisable(false));
+      }
+      for (auto & kv : buses_) {
+        kv.second->Stop();
+        kv.second->Close();
+      }
+      return CallbackReturn::ERROR;
+    };
+
   const uint64_t probe_start_ns = robstride_sdk::NowNs();
   const auto probe_deadline = std::chrono::steady_clock::now() +
     std::chrono::milliseconds(static_cast<int64_t>(error_timeout_ms_));
   auto probed = [probe_start_ns](const JointHandle & jh) {
-      return jh.motor->state().last_update_ns.load(std::memory_order_relaxed) > probe_start_ns;
+      // A fault word or truncated frame does not contain a measured position.
+      return jh.motor->state().last_feedback_ns.load(std::memory_order_acquire) > probe_start_ns;
     };
   while (std::chrono::steady_clock::now() < probe_deadline &&
     !std::all_of(joints_.begin(), joints_.end(), probed))
@@ -544,19 +560,23 @@ CallbackReturn RobstrideHardware::on_activate(
         "Joint '" << jh.joint_name << "' (id=" << static_cast<int>(jh.id) <<
           ") reported no position within " << error_timeout_ms_ <<
           " ms; refusing to enable torque against an unknown target");
-      for (auto & other : joints_) {
-        buses_[other.can_interface]->SendFrame(other.motor->EncodeDisable(false));
-      }
-      for (auto & kv : buses_) {
-        kv.second->Stop();
-        kv.second->Close();
-      }
-      return CallbackReturn::ERROR;
+      return abort_activation();
     }
 
     // Same source write() uses one cycle later, not MECH_POS: a target in a
     // different frame would just move the jump one cycle later.
     const float measured = jh.motor->state().position.load(std::memory_order_relaxed);
+    const double joint_position = WrapMotorPosition(i, measured);
+    if (!MeasuredWithinBounds(i, measured)) {
+      if (torque_enabled_desired_.load(std::memory_order_relaxed)) {
+        RCLCPP_ERROR_STREAM(logger_, "Joint '" << jh.joint_name << "' measured position " <<
+          joint_position << " is outside its declared bounds; refusing activation");
+        return abort_activation();
+      }
+      RCLCPP_ERROR_STREAM(logger_, "Joint '" << jh.joint_name << "' measured position " <<
+        joint_position << " is outside its declared bounds; activating with torque off, and "
+        "~/set_torque(true) is refused until it is back within bounds");
+    }
     switch (jh.control_mode) {
       case robstride_sdk::RunMode::RUN_MODE_POSITION_PP:
       case robstride_sdk::RunMode::RUN_MODE_POSITION_CSP:
@@ -576,7 +596,7 @@ CallbackReturn RobstrideHardware::on_activate(
     }
 
     // Seed the command interfaces from the same reading.
-    hw_state_position_[i] = WrapMotorPosition(i, measured);
+    hw_state_position_[i] = joint_position;
     hw_cmd_position_[i] = hw_state_position_[i];
     hw_cmd_velocity_[i] = 0.0;
     hw_cmd_effort_[i] = 0.0;
@@ -617,7 +637,7 @@ CallbackReturn RobstrideHardware::on_activate(
     for (size_t i = 0; i < joints_.size(); ++i) {
       if (confirmed[i]) {continue;}
       const robstride_sdk::MotorState & st = joints_[i].motor->state();
-      if (st.last_update_ns.load(std::memory_order_relaxed) > activate_start_ns &&
+      if (st.last_feedback_ns.load(std::memory_order_acquire) > activate_start_ns &&
         st.run_state.load(std::memory_order_relaxed) ==
         static_cast<uint8_t>(robstride_sdk::RunState::MOTOR))
       {
@@ -661,14 +681,7 @@ CallbackReturn RobstrideHardware::on_activate(
             "it must be re-plugged and re-configured with scripts/setup_can.sh.");
       }
     }
-    for (auto & jh : joints_) {
-      buses_[jh.can_interface]->SendFrame(jh.motor->EncodeDisable(false));
-    }
-    for (auto & kv : buses_) {
-      kv.second->Stop();
-      kv.second->Close();
-    }
-    return CallbackReturn::ERROR;
+    return abort_activation();
   }
 
   // Seed the command interfaces from measured state so write()'s first
@@ -721,7 +734,7 @@ return_type RobstrideHardware::read(
   const rclcpp::Time & time, const rclcpp::Duration & /*period*/)
 {
   UpdateThermalLatch();
-  bool any_fault = false;
+  bool any_stale = false;
   bool any_lost = false;
   std::string lost_joints;
   const uint64_t now_ns = robstride_sdk::NowNs();
@@ -737,7 +750,6 @@ return_type RobstrideHardware::read(
       static_cast<double>(st.run_state.load(std::memory_order_relaxed));
     hw_state_fault_bits_[i] =
       static_cast<double>(st.fault_bits.load(std::memory_order_relaxed));
-    any_fault |= st.fault_present.load(std::memory_order_relaxed);
 
     // While untorqued, track the command to the measured position so the
     // motor has a fresh target the instant it re-engages.
@@ -750,6 +762,11 @@ return_type RobstrideHardware::read(
       // moved while limp, so it must resume holding where it actually is.
       freeze_position_[i] = hw_state_position_[i];
     }
+
+    const uint64_t last_ns = st.last_update_ns.load(std::memory_order_relaxed);
+    const double elapsed_ms = ElapsedMsSinceUpdate(now_ns, last_ns);
+    const bool stale = elapsed_ms<0.0 || elapsed_ms> error_timeout_ms_;
+    any_stale |= stale;
 
     if (!is_active_) {
       continue;
@@ -768,9 +785,6 @@ return_type RobstrideHardware::read(
       dropped_out = seen_enabled_[i];
     }
 
-    const uint64_t last_ns = st.last_update_ns.load(std::memory_order_relaxed);
-    const double elapsed_ms = ElapsedMsSinceUpdate(now_ns, last_ns);
-    const bool stale = elapsed_ms<0.0 || elapsed_ms> error_timeout_ms_;
     if (stale || dropped_out) {
       any_lost = true;
       // Collected, not logged here: _THROTTLE suppresses per call site, so
@@ -785,7 +799,9 @@ return_type RobstrideHardware::read(
   if (state_pub_uni_ptr_ && state_pub_uni_ptr_->trylock()) {
     auto & msg = state_pub_uni_ptr_->msg_;
     msg.header.stamp = time;
-    msg.comm_state = any_fault ? -1 : 0;
+    // Link freshness is independent of a motor's fault/status word. Keep the
+    // existing 0/-1 convention; per-motor fault_bits and enabled remain separate.
+    msg.comm_state = any_stale ? -1 : 0;
     for (size_t i = 0; i < joints_.size(); ++i) {
       const robstride_sdk::MotorState & st = joints_[i].motor->state();
       msg.id[i] = joints_[i].id;
@@ -973,15 +989,26 @@ double RobstrideHardware::WrapMotorPosition(size_t i, double motor_position)
   return wrapped;
 }
 
+bool RobstrideHardware::MeasuredWithinBounds(size_t i, double motor_position) const
+{
+  const JointHandle & jh = joints_[i];
+  const double joint_position = WrapToWindow(jh.direction * motor_position, jh.wrap_center);
+  const auto limit = info_.limits.find(jh.joint_name);
+  if (limit == info_.limits.end() || !limit->second.has_position_limits) {
+    return std::isfinite(joint_position);
+  }
+  // One full Type-2 position quantum permits HOME exactly on a limit. This
+  // is not a commissioning allowance or a command-limit relaxation.
+  const double feedback_quantum = 2.0 * jh.motor->limits().position_max / 65535.0;
+  return PositionWithinBounds(joint_position, limit->second.min_position,
+           limit->second.max_position, feedback_quantum);
+}
+
 double RobstrideHardware::MotorTargetPosition(size_t i, double joint_position) const
 {
   const JointHandle & jh = joints_[i];
-  double delta = joint_position - hw_state_position_[i];
-  if (jh.continuous) {
-    // The same pose sits every 2*pi, so take the nearest one.
-    delta = WrapToWindow(delta, 0.0);
-  }
-  return jh.direction * (hw_state_position_[i] + wrap_offset_[i] + delta);
+  return JointToMotorTarget(joint_position, hw_state_position_[i], wrap_offset_[i],
+    jh.direction, jh.continuous);
 }
 
 JointHandle * RobstrideHardware::FindJointById(uint8_t id)
@@ -1138,6 +1165,15 @@ void RobstrideHardware::SetTorqueCallback(
     response->message =
       "Thermal trip latched; no re-enable until successful rest/OFF recovery and cooling";
     return;
+  }
+  for (size_t i = 0; request->data && i < joints_.size(); ++i) {
+    const float measured = joints_[i].motor->state().position.load(std::memory_order_relaxed);
+    if (!MeasuredWithinBounds(i, measured)) {
+      response->success = false;
+      response->message = "Joint '" + joints_[i].joint_name +
+        "' measured position is outside its declared bounds; refusing to enable torque";
+      return;
+    }
   }
   torque_enabled_desired_.store(request->data, std::memory_order_relaxed);
   response->success = true;
