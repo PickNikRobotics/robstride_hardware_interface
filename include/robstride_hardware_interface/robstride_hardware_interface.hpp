@@ -198,6 +198,7 @@ private:
   // stall the RT loop for the duration of any slow callback.
   rclcpp::executors::SingleThreadedExecutor::SharedPtr service_executor_;
   std::thread service_executor_thread_;
+  std::atomic<bool> service_executor_stopped_{false};
 
   void GetDataCallback(
     const std::shared_ptr<robstride_interfaces::srv::GetDataFromRobstride::Request> request,
@@ -218,6 +219,9 @@ private:
   // Joint-frame position of joint i from a raw motor reading, wrapped into
   // the joint's window. Records the dropped turns in wrap_offset_.
   double WrapMotorPosition(size_t i, double motor_position);
+  // Whether a raw motor reading lies within joint i's URDF position limits,
+  // allowing one Type-2 feedback quantum. Records nothing.
+  bool MeasuredWithinBounds(size_t i, double motor_position) const;
   // Motor-frame target for a joint-frame position target.
   double MotorTargetPosition(size_t i, double joint_position) const;
 

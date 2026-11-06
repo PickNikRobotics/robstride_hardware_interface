@@ -22,6 +22,7 @@ included: the companion PickNik RobstrideSDK decodes fault words already.
 
 PickNik Inc. modifications (2026): hold-torque lifecycle and regression tests;
 thermal latching, recovery handoff and tests; bounded motion-mode effort
-feedforward and tests; fork-specific documentation and notice installation.
+feedforward and tests; activation position bounds, link-only comm_state and
+virtual-CAN follower tests; fork-specific documentation and notice installation.
 Existing author attributions in the source files and Git history are retained.
 These notices do not change the license or claim physical qualification.
