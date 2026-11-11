@@ -46,9 +46,12 @@
 #include "robstride_interfaces/srv/set_zero_robstride.hpp"
 #include "robstride_interfaces/srv/reboot_robstride.hpp"
 #include "std_srvs/srv/set_bool.hpp"
+#include "std_srvs/srv/trigger.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/u_int64.hpp"
 #include "robstride_hardware_interface/thermal_latch.hpp"
+#include "robstride_hardware_interface/relaxation.hpp"
+#include "robstride_hardware_interface/can_tx_retry.hpp"
 
 #include "realtime_tools/realtime_publisher.hpp"
 
@@ -136,6 +139,7 @@ private:
 
   std::vector<JointHandle> joints_;
   std::unordered_map<std::string, std::unique_ptr<robstride_sdk::CanBus>> buses_;
+  std::unordered_map<std::string, CanTxRetry> can_tx_retry_;
   std::vector<std::unique_ptr<robstride_sdk::RobstrideMotor>> motors_;
 
   std::vector<double> hw_state_position_;
@@ -194,9 +198,58 @@ private:
   // When write() last sent this joint its re-enable burst. Rate limited to
   // stay inside the bus budget; see kRecoveryResendNs.
   std::vector<uint64_t> last_recovery_ns_;
-  // Set by SetTorqueCallback (service thread), consumed by write(), which
-  // sends the actual Enable/Disable frames.
+  // Re-enable sequence advances only after the current frame was queued.
+  // One frame per motor/cycle replaces the all-motor burst (35 frames on
+  // reBot), so a stock txqueuelen=10 has room to drain between steps.
+  enum class RecoveryStep {Mode, Watchdog, Preload, Enable, Hold, Waiting};
+  std::vector<RecoveryStep> recovery_step_;
+  // RT-owned desired torque (also read by the thermal handoff). Service
+  // callbacks enqueue requests; write() sends actual Enable/Disable frames.
   std::atomic<bool> torque_enabled_desired_{true};
+
+  std::vector<RelaxSafePose> relax_safe_poses_;
+  std::unique_ptr<StillnessHistory> stillness_history_;
+  std::unique_ptr<MeasuredHold> measured_hold_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr relaxed_pub_;
+  rclcpp::TimerBase::SharedPtr relaxation_timer_;
+  std::atomic<bool> relaxed_state_{false};
+  std::atomic<bool> ignored_relaxed_command_{false};
+
+  // One service executor is the mailbox producer; only write() consumes it.
+  // The service waits for an atomic completion, never the control loop.
+  enum class TorqueOperation {None, Relax, Engage};
+  // The legacy SetBool remains a queued maintenance override, not a safe
+  // relax request. Bounds snapshots avoid reading RT coordinate buffers.
+  std::atomic<int> maintenance_torque_request_{-1};
+  std::vector<std::atomic<bool>> measured_in_bounds_;
+  enum class TorqueResult
+  {
+    Confirmed, AlreadyEngaged, Inactive, NotConfigured, PoseMismatch, HistoryMissing,
+    MeasuredMoving, CommandMoving, Unhealthy, OutOfBounds, ThermalTrip,
+    Frozen, TimedOut
+  };
+  enum class TorqueRequestState {Idle, Queued, Applying, Active, Cancelled, Complete};
+  std::atomic<TorqueOperation> torque_request_{TorqueOperation::None};
+  std::atomic<TorqueRequestState> torque_request_state_{TorqueRequestState::Idle};
+  std::atomic<uint64_t> torque_request_deadline_ns_{0};
+  std::atomic<uint64_t> torque_request_start_ns_{0};
+  std::atomic<TorqueResult> torque_result_{TorqueResult::Confirmed};
+  std::atomic<size_t> torque_result_index_{0};
+  std::atomic<double> torque_result_ms_{0.0};
+  std::atomic<double> torque_result_max_step_{0.0};
+  // Remaining transition state is exclusively RT-owned.
+  TorqueOperation torque_transition_ = TorqueOperation::None;
+  uint64_t torque_transition_start_ns_ = 0;
+  uint64_t torque_transition_deadline_ns_ = 0;
+  size_t relaxed_pose_ = 0;
+  bool engage_from_relaxed_ = false;
+  double engage_max_step_ = 0.0;
+  std::vector<double> engage_start_position_;
+  std::vector<uint64_t> torque_feedback_after_ns_;
+  std::vector<bool> torque_hold_sent_;
+  std::vector<uint64_t> measured_feedback_ns_;
+  std::vector<bool> measured_fault_present_;
+  uint64_t last_read_ns_ = 0;
 
   using RobstrideStateMsg = robstride_interfaces::msg::RobstrideState;
   using StatePublisher = realtime_tools::RealtimePublisher<RobstrideStateMsg>;
@@ -207,6 +260,8 @@ private:
   rclcpp::Service<robstride_interfaces::srv::SetDataToRobstride>::SharedPtr set_data_srv_;
   rclcpp::Service<robstride_interfaces::srv::SetZeroRobstride>::SharedPtr set_zero_srv_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr set_torque_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr relax_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr engage_srv_;
   rclcpp::Service<robstride_interfaces::srv::RebootRobstride>::SharedPtr reboot_srv_;
 
   // Services are spun on their own thread: spinning inside read() would
@@ -227,6 +282,21 @@ private:
   void SetTorqueCallback(
     const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
     std::shared_ptr<std_srvs::srv::SetBool::Response> response);
+  void RelaxCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  void EngageCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  bool RequestTorque(TorqueOperation operation, std::string & message);
+  void ApplyTorqueRequest(uint64_t now_ns);
+  void CheckTorqueTransition(uint64_t now_ns);
+  void FinishTorqueRequest(TorqueResult result, size_t index, uint64_t now_ns);
+  bool HealthyForTorque(uint64_t now_ns) const;
+  bool AllMeasuredWithinBounds(size_t & outside) const;
+  void SeedMeasuredCommands();
+  can_frame RecoveryFrame(size_t i) const;
+  void RecoveryFrameQueued(size_t i, uint64_t now_ns);
   void RebootCallback(
     const std::shared_ptr<robstride_interfaces::srv::RebootRobstride::Request> request,
     std::shared_ptr<robstride_interfaces::srv::RebootRobstride::Response> response);

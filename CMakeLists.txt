@@ -27,6 +27,8 @@ find_package(robstride_sdk REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(robstride_interfaces REQUIRED)
+find_package(yaml_cpp_vendor REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 ################################################################################
 # Build
@@ -35,6 +37,7 @@ add_library(
   ${PROJECT_NAME}
   SHARED
   src/robstride_hardware_interface.cpp
+  src/relaxation.cpp
 )
 
 target_include_directories(
@@ -59,6 +62,7 @@ target_link_libraries(${PROJECT_NAME}
   ${std_msgs_TARGETS}
   ${robstride_interfaces_TARGETS}
   ${realtime_tools_TARGETS}
+  yaml-cpp::yaml-cpp
 )
 
 pluginlib_export_plugin_description_file(hardware_interface robstride_hardware_interface_plugin.xml)
@@ -114,7 +118,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_fake_follower ${PROJECT_NAME})
   ament_add_gtest(test_joint_coordinates test/test_joint_coordinates.cpp)
   target_link_libraries(test_joint_coordinates ${PROJECT_NAME})
-  set_tests_properties(test_deactivate_torque test_fake_follower PROPERTIES
+  ament_add_gtest(test_relaxation test/test_relaxation.cpp)
+  target_link_libraries(test_relaxation ${PROJECT_NAME})
+  ament_add_gtest(test_relax_services test/test_relax_services.cpp TIMEOUT 90)
+  target_include_directories(test_relax_services PRIVATE test)
+  target_link_libraries(test_relax_services ${PROJECT_NAME})
+  set_tests_properties(test_deactivate_torque test_fake_follower test_relax_services PROPERTIES
     RESOURCE_LOCK robstride_vcan)
   # Shared fixture for downstream workspace tests, never part of runtime headers.
   install(FILES test/fake_robstride_motor.hpp test/with_vcan.py
@@ -136,6 +145,9 @@ ament_export_dependencies(
   robstride_interfaces
   realtime_tools
   std_msgs
+  std_srvs
+  yaml_cpp_vendor
+  yaml-cpp
 )
 
 ament_package()
