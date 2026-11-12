@@ -211,6 +211,9 @@ CallbackReturn RobstrideHardware::on_init(
   hw_cmd_velocity_.assign(n, 0.0);
   freeze_position_.assign(n, 0.0);
   wrap_offset_.assign(n, 0.0);
+  wrap_seeded_.assign(n, false);
+  last_motor_position_.assign(n, 0.0);
+  soft_prev_cmd_.assign(n, 0.0);
   seen_enabled_.assign(n, false);
   last_recovery_ns_.assign(n, 0);
   hw_cmd_effort_.assign(n, 0.0);
@@ -298,6 +301,31 @@ CallbackReturn RobstrideHardware::on_init(
       return CallbackReturn::ERROR;
     }
     jh.can_interface = can_if;
+
+    // Optional soft limits live on the <joint> (not the gpio), like "id".
+    const std::string soft_lo = GetJointParam(joint, "soft_lower_limit", "");
+    const std::string soft_hi = GetJointParam(joint, "soft_upper_limit", "");
+    const std::string soft_k = GetJointParam(joint, "soft_k_position", "");
+    if (!soft_lo.empty() || !soft_hi.empty() || !soft_k.empty()) {
+      try {
+        jh.soft_lower = std::stod(soft_lo);
+        jh.soft_upper = std::stod(soft_hi);
+        jh.soft_k_position = std::stod(soft_k);
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR_STREAM(logger_, "Joint '" << joint.name << "': soft_lower_limit, "
+          "soft_upper_limit and soft_k_position must all be numbers: " << e.what());
+        return CallbackReturn::ERROR;
+      }
+      if (!(std::isfinite(jh.soft_lower) && std::isfinite(jh.soft_upper) &&
+        jh.soft_lower < jh.soft_upper && jh.soft_k_position > 0.0 &&
+        std::isfinite(jh.soft_k_position)))
+      {
+        RCLCPP_ERROR_STREAM(logger_, "Joint '" << joint.name << "': soft limits need "
+          "soft_lower_limit < soft_upper_limit and a finite soft_k_position > 0");
+        return CallbackReturn::ERROR;
+      }
+      jh.has_soft_limits = true;
+    }
 
     // A single-turn reading can only be placed unambiguously inside a
     // window narrower than one turn, so center it on the joint's range.
@@ -566,7 +594,8 @@ CallbackReturn RobstrideHardware::on_activate(
     // Same source write() uses one cycle later, not MECH_POS: a target in a
     // different frame would just move the jump one cycle later.
     const float measured = jh.motor->state().position.load(std::memory_order_relaxed);
-    const double joint_position = WrapMotorPosition(i, measured);
+    wrap_seeded_[i] = false;  // a fresh activation chooses the turn again
+    const double joint_position = JointPosition(i, measured);
     if (!MeasuredWithinBounds(i, measured)) {
       if (torque_enabled_desired_.load(std::memory_order_relaxed)) {
         RCLCPP_ERROR_STREAM(logger_, "Joint '" << jh.joint_name << "' measured position " <<
@@ -598,6 +627,7 @@ CallbackReturn RobstrideHardware::on_activate(
     // Seed the command interfaces from the same reading.
     hw_state_position_[i] = joint_position;
     hw_cmd_position_[i] = hw_state_position_[i];
+    soft_prev_cmd_[i] = hw_state_position_[i];
     hw_cmd_velocity_[i] = 0.0;
     hw_cmd_effort_[i] = 0.0;
   }
@@ -688,8 +718,9 @@ CallbackReturn RobstrideHardware::on_activate(
   // cycle holds position instead of snapping to 0.
   for (size_t i = 0; i < joints_.size(); ++i) {
     hw_state_position_[i] =
-      WrapMotorPosition(i, joints_[i].motor->state().position.load(std::memory_order_relaxed));
+      JointPosition(i, joints_[i].motor->state().position.load(std::memory_order_relaxed));
     hw_cmd_position_[i] = hw_state_position_[i];
+    soft_prev_cmd_[i] = hw_state_position_[i];
     hw_cmd_velocity_[i] = 0.0;
     hw_cmd_effort_[i] = 0.0;
   }
@@ -742,7 +773,7 @@ return_type RobstrideHardware::read(
   for (size_t i = 0; i < joints_.size(); ++i) {
     const robstride_sdk::MotorState & st = joints_[i].motor->state();
     const double dir = joints_[i].direction;
-    hw_state_position_[i] = WrapMotorPosition(i, st.position.load(std::memory_order_relaxed));
+    hw_state_position_[i] = JointPosition(i, st.position.load(std::memory_order_relaxed));
     hw_state_velocity_[i] = dir * st.velocity.load(std::memory_order_relaxed);
     hw_state_effort_[i] = dir * st.torque.load(std::memory_order_relaxed);
     hw_state_temperature_[i] = st.temperature.load(std::memory_order_relaxed);
@@ -758,6 +789,7 @@ return_type RobstrideHardware::read(
       hw_cmd_position_[i] = hw_state_position_[i];
       hw_cmd_velocity_[i] = 0.0;
       hw_cmd_effort_[i] = 0.0;
+      soft_prev_cmd_[i] = hw_state_position_[i];
       // Same for the frozen hold target: a joint that dropped out may have
       // moved while limp, so it must resume holding where it actually is.
       freeze_position_[i] = hw_state_position_[i];
@@ -859,8 +891,9 @@ return_type RobstrideHardware::read(
 }
 
 return_type RobstrideHardware::write(
-  const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
 {
+  const double dt = period.seconds() > 0.0 ? period.seconds() : 0.01;
   const uint64_t now_ns = robstride_sdk::NowNs();
   const bool torque_desired = torque_enabled_desired_.load(std::memory_order_relaxed);
 
@@ -928,8 +961,8 @@ return_type RobstrideHardware::write(
     // driven by writing their own target parameter. While frozen the
     // controllers are not in charge, so hold the captured position.
     // Controllers speak the joint frame; MotorTargetPosition() maps back.
-    const double target_position =
-      MotorTargetPosition(i, frozen_ ? freeze_position_[i] : hw_cmd_position_[i]);
+    const double target_position = MotorTargetPosition(
+      i, frozen_ ? freeze_position_[i] : SoftLimitedTarget(i, hw_cmd_position_[i], dt));
     const double target_velocity = jh.direction * (frozen_ ? 0.0 : hw_cmd_velocity_[i]);
     const double target_effort = jh.direction * (frozen_ ? 0.0 : hw_cmd_effort_[i]);
 
@@ -989,10 +1022,57 @@ double RobstrideHardware::WrapMotorPosition(size_t i, double motor_position)
   return wrapped;
 }
 
+double RobstrideHardware::JointPosition(size_t i, double motor_position)
+{
+  const JointHandle & jh = joints_[i];
+  if (jh.continuous) {
+    return WrapMotorPosition(i, motor_position);
+  }
+  // The SDK reports a continuous motor angle, but starts a fresh baseline
+  // after a feedback gap (a motor power cycle may reframe it). No real motion
+  // covers pi in one cycle, so treat such a step as a reframe and fold again.
+  if (!wrap_seeded_[i] || std::abs(motor_position - last_motor_position_[i]) > M_PI) {
+    const double wrapped = WrapMotorPosition(i, motor_position);
+    wrap_seeded_[i] = true;
+    last_motor_position_[i] = motor_position;
+    return wrapped;
+  }
+  last_motor_position_[i] = motor_position;
+  return jh.direction * motor_position - wrap_offset_[i];
+}
+
+double RobstrideHardware::SoftLimitedTarget(size_t i, double target, double dt)
+{
+  const JointHandle & jh = joints_[i];
+  if (!jh.has_soft_limits || !std::isfinite(target)) {
+    soft_prev_cmd_[i] = target;
+    return target;
+  }
+  // JointSoftLimiter-style position rule on the previous target: moving toward
+  // a soft limit, a step is at most k * (distance left) * dt (k*dt capped at 1),
+  // so the target approaches the limit asymptotically and never passes it.
+  // A target already beyond a soft limit cannot move further out, and may
+  // always move back in. Motion away from the limits is not restricted.
+  const double prev = soft_prev_cmd_[i];
+  const double gain = std::min(1.0, jh.soft_k_position * dt);
+  double limited = target;
+  if (target > prev) {
+    limited = std::min(target, prev + std::max(0.0, jh.soft_upper - prev) * gain);
+  } else if (target < prev) {
+    limited = std::max(target, prev - std::max(0.0, prev - jh.soft_lower) * gain);
+  }
+  soft_prev_cmd_[i] = limited;
+  return limited;
+}
+
 bool RobstrideHardware::MeasuredWithinBounds(size_t i, double motor_position) const
 {
   const JointHandle & jh = joints_[i];
-  const double joint_position = WrapToWindow(jh.direction * motor_position, jh.wrap_center);
+  // After activation a bounded joint reports its continuous value; before it,
+  // (or when continuous) the reading is folded into the window.
+  const double joint_position = (!jh.continuous && wrap_seeded_[i]) ?
+    jh.direction * motor_position - wrap_offset_[i] :
+    WrapToWindow(jh.direction * motor_position, jh.wrap_center);
   const auto limit = info_.limits.find(jh.joint_name);
   if (limit == info_.limits.end() || !limit->second.has_position_limits) {
     return std::isfinite(joint_position);

@@ -202,9 +202,15 @@ Disable, so the motors hold until their own watchdog fires. Setting
 `hold_torque_on_deactivate` makes the clean path agree with the crash path rather than
 contradict it.
 
+### Soft position limits
+
+A joint may declare `soft_lower_limit`, `soft_upper_limit` and `soft_k_position` (1/s) as `<param>`s on its ros2_control `<joint>`. `write()` then applies a JointSoftLimiter-style rule to the position target: moving toward a soft limit, a step is at most `k * (distance left) * dt` (with `k*dt` capped at 1). The target slows and stops at the limit and never passes it; a target already past a soft limit cannot move further out, and may always move back in. Without these params a position command is sent unchanged (the driver itself never clamps a command). They are deliberately not read from URDF `<safety_controller>`, which MoveIt would also use to narrow its planning bounds.
+
 ### Position after a motor power cycle
 
 A motor only knows its angle within one turn when it powers up, so after a power cycle its reading can come back offset by a whole multiple of 2π. The reported `position` is therefore wrapped into a one-turn window centered on the middle of the joint's URDF limits (0 for a joint without position limits), and `write()` adds the dropped turns back before sending a target. A joint whose range is narrower than a full turn reads the same after a power cycle as before it. A joint without position limits is treated as continuous: its targets take the shortest way round.
+
+The window is applied **once**: at activation, and again only if the SDK restarts its position baseline (a step of more than pi between two cycles, which no real motion produces). In between, a joint with position limits reports its continuous angle, so a joint that runs past its window edge keeps counting instead of jumping a full turn, and every target stays in the same turn. (Folding on every read let a fast jaw overshoot cross the edge; the reading jumped by 2*pi and every later target landed one turn further open.) Joints without position limits keep folding on every read.
 
 This recovers whole turns only. A mechanical zero the motor forgets across a power cycle shifts the reading by an arbitrary amount, and the wrapped value then looks plausible but is wrong. Make sure the zero is stored in the motor before relying on this.
 

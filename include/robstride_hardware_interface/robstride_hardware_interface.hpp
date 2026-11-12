@@ -72,6 +72,14 @@ struct JointHandle
   double wrap_center = 0.0;
   // No URDF position limits: targets take the shortest way round.
   bool continuous = false;
+  // Optional driver-side soft position limits (joint frame), from the joint's
+  // soft_lower_limit / soft_upper_limit / soft_k_position parameters. Approaching
+  // a soft limit, the commanded position may move at most k * (distance left)
+  // per second, so it slows and stops at the limit instead of passing it.
+  bool has_soft_limits = false;
+  double soft_lower = 0.0;
+  double soft_upper = 0.0;
+  double soft_k_position = 0.0;
   // Bound on the motion-mode torque feedforward (N*m, joint frame).
   double max_feedforward_effort = 0.0;
   robstride_sdk::RobstrideMotor * motor;  // owned by RobstrideHardware::motors_
@@ -172,6 +180,13 @@ private:
   // Whole turns (joint frame) dropped when wrapping each joint's position;
   // write() adds them back so targets land in the motor's own frame.
   std::vector<double> wrap_offset_;
+  // Bounded joints fold their reading into the window once, at activation
+  // (or after the SDK starts a fresh position baseline), then report the
+  // continuous value: crossing the window edge while running never jumps 2*pi.
+  std::vector<bool> wrap_seeded_;
+  std::vector<double> last_motor_position_;
+  // Last position target after the soft-limit rate rule (joint frame).
+  std::vector<double> soft_prev_cmd_;
   // Joint confirmed enabled since torque was last requested. Leaving the
   // enabled state after that means the motor rebooted or faulted, not that
   // it is still waiting for its first Enable.
@@ -219,6 +234,11 @@ private:
   // Joint-frame position of joint i from a raw motor reading, wrapped into
   // the joint's window. Records the dropped turns in wrap_offset_.
   double WrapMotorPosition(size_t i, double motor_position);
+  // Joint-frame position of joint i for the RT loop: folded once (see
+  // wrap_seeded_), continuous afterwards. Continuous joints keep folding.
+  double JointPosition(size_t i, double motor_position);
+  // Joint-frame position target after the soft-limit rate rule.
+  double SoftLimitedTarget(size_t i, double target, double dt);
   // Whether a raw motor reading lies within joint i's URDF position limits,
   // allowing one Type-2 feedback quantum. Records nothing.
   bool MeasuredWithinBounds(size_t i, double motor_position) const;

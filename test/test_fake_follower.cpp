@@ -23,6 +23,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "hardware_interface/types/hardware_component_interface_params.hpp"
@@ -513,6 +514,166 @@ TEST_F(FollowerTest, TransmitFailureIsCapturedBySdkWithoutBlocking)
   EXPECT_FALSE(bus.SendFrame(motor.EncodeEnable()));
   EXPECT_EQ(bus.last_send_errno(), EBADF);
   EXPECT_LT(std::chrono::steady_clock::now() - start, 100ms);
+}
+
+// Jaw limits measured on the bench: closed contact to the open stop (5.84),
+// centred so the one-turn window is [-0.277, 6.007).
+hardware_interface::HardwareInfo JawInfo(
+  double lower = -0.15, double upper = 5.88, bool soft = false, double soft_upper = 5.41)
+{
+  auto info = Info();
+  info.limits["joint7"].min_position = lower;
+  info.limits["joint7"].max_position = upper;
+  if (soft) {
+    info.joints[6].parameters["soft_lower_limit"] = std::to_string(lower);
+    info.joints[6].parameters["soft_upper_limit"] = std::to_string(soft_upper);
+    info.joints[6].parameters["soft_k_position"] = "10";
+  }
+  return info;
+}
+
+void Step(Hardware & hardware, const rclcpp::Duration & period, int cycles = 1)
+{
+  for (int k = 0; k < cycles; ++k) {
+    EXPECT_EQ(hardware.read(hardware.now(), period), Return::OK);
+    EXPECT_EQ(hardware.write(hardware.now(), period), Return::OK);
+    std::this_thread::sleep_for(10ms);
+  }
+}
+
+TEST_F(FollowerTest, FoldOnceJawCrossesTheWindowEdgeWithoutAOneTurnJump)
+{
+  Pose({.2, .7, .9, -.2, .3, -.4, 5.0});
+  Initialize(JawInfo());
+  ASSERT_EQ(hardware->on_activate(lifecycle), Callback::SUCCESS);
+  Cycle();
+  ASSERT_NEAR(Position(6), 5.0, .001);
+  // Drive the jaw past the window edge (6.007) by hand, as the 15 rad/s
+  // overshoot did past the old 5.772 edge; the reading must keep counting.
+  follower->motor(6).set_follow(false);
+  for (double p : {5.6, 5.9, 6.0, 6.05, 6.1}) {
+    follower->motor(6).set_position(p);
+    Step(*hardware, period, 3);
+    EXPECT_NEAR(Position(6), p, .002) << "reading folded at " << p;
+  }
+  // A command is sent in the same turn, not one turn further open.
+  follower->motor(6).set_follow(true);
+  Command(6, .5);
+  Cycle();
+  EXPECT_NEAR(follower->motor(6).position(), .5, .002);
+  EXPECT_NEAR(Position(6), .5, .002);
+}
+
+TEST_F(FollowerTest, PerReadFoldIsGoneEvenWithTodaysNarrowWindow)
+{
+  // Today's limits -0.15..5.41: window edge 5.772, the one crossed on the bench.
+  Pose({.2, .7, .9, -.2, .3, -.4, 5.3});
+  Initialize(JawInfo(-0.15, 5.41));
+  ASSERT_EQ(hardware->on_activate(lifecycle), Callback::SUCCESS);
+  Cycle();
+  follower->motor(6).set_follow(false);
+  for (double p : {5.6, 5.724, 5.78, 5.84}) {
+    follower->motor(6).set_position(p);
+    Step(*hardware, period, 3);
+    EXPECT_NEAR(Position(6), p, .002) << "reading folded at " << p;
+  }
+  follower->motor(6).set_follow(true);
+  Command(6, .021);
+  Cycle();
+  EXPECT_NEAR(follower->motor(6).position(), .021, .002) << "target landed a turn away";
+}
+
+TEST_F(FollowerTest, ActivationSeedsTheJawClosedPartlyOpenAndAtTheStop)
+{
+  constexpr double kTwoPi = 2 * M_PI;
+  // {raw motor angle at power-up, expected joint reading}: zero_sta 0 reports
+  // 0..2pi, zero_sta 1 reports -pi..pi; both must land on the physical angle.
+  const std::vector<std::pair<double, double>> cases{
+    {.157, .157}, {1.0, 1.0}, {3.0, 3.0}, {3.0 - kTwoPi, 3.0}, {5.84, 5.84},
+    {5.84 - kTwoPi, 5.84}, {kTwoPi - .0105, -.0105}, {kTwoPi - .12, -.12}};
+  for (const auto & [raw, expected] : cases) {
+    Pose({.2, .7, .9, -.2, .3, -.4, raw});
+    Initialize(JawInfo());
+    ASSERT_EQ(hardware->on_activate(lifecycle), Callback::SUCCESS) << raw;
+    Cycle(50);
+    EXPECT_NEAR(Position(6), expected, .002) << "raw " << raw;
+    EXPECT_NEAR(command[6].get_optional().value(), expected, .002) << "raw " << raw;
+    // Holding the seeded command must not move the motor.
+    EXPECT_NEAR(follower->motor(6).position(), raw, .002) << "raw " << raw;
+    ASSERT_EQ(hardware->on_deactivate(lifecycle), Callback::SUCCESS);
+    hardware.reset();
+  }
+}
+
+TEST_F(FollowerTest, TodaysNarrowWindowRefusesTheJawAtTheOpenStop)
+{
+  // Documents why the jaw limits move: 5.84 folds to -0.443 in -0.15..5.41.
+  Pose({.2, .7, .9, -.2, .3, -.4, 5.84});
+  Initialize(JawInfo(-0.15, 5.41));
+  EXPECT_EQ(hardware->on_activate(lifecycle), Callback::ERROR);
+}
+
+TEST_F(FollowerTest, ReframedFeedbackFoldsAgainInsteadOfJumping)
+{
+  Pose({.2, .7, .9, -.2, .3, -.4, -.0105});
+  Initialize(JawInfo());
+  ASSERT_EQ(hardware->on_activate(lifecycle), Callback::SUCCESS);
+  Cycle();
+  // A power-cycled motor (zero_sta 0) reports the same closed jaw as 2*pi - 0.0105.
+  follower->motor(6).set_follow(false);
+  follower->motor(6).set_position(2 * M_PI - .0105);
+  Step(*hardware, period, 3);
+  EXPECT_NEAR(Position(6), -.0105, .002);
+}
+
+TEST_F(FollowerTest, SoftLimitSlowsAndStopsAPastLimitCommand)
+{
+  Pose({.2, .7, .9, -.2, .3, -.4, 1.0});
+  Initialize(JawInfo(-0.15, 5.88, true, 5.41));
+  ASSERT_EQ(hardware->on_activate(lifecycle), Callback::SUCCESS);
+  Cycle(50);
+  Command(6, 5.8);  // past the 5.41 soft limit, inside the 5.88 hard limit
+  std::vector<double> sent;
+  for (int k = 0; k < 150; ++k) {
+    Step(*hardware, period);
+    sent.push_back(follower->motor(6).position());
+  }
+  double peak = 0, last_step = 1e9;
+  for (size_t k = 1; k < sent.size(); ++k) {
+    EXPECT_GE(sent[k], sent[k - 1] - 1e-3) << k;
+    peak = std::max(peak, sent[k]);
+  }
+  EXPECT_LE(peak, 5.41 + .001);
+  EXPECT_NEAR(sent.back(), 5.41, .01);
+  // It slowed: the late steps are far smaller than the first.
+  last_step = sent.back() - sent[sent.size() - 2];
+  EXPECT_GT(sent[1] - sent[0], 10 * std::max(last_step, 1e-6));
+  // Coming back in is not held back.
+  Command(6, 1.0);
+  Step(*hardware, period, 30);
+  EXPECT_NEAR(follower->motor(6).position(), 1.0, .01);
+}
+
+TEST_F(FollowerTest, WithoutSoftLimitsAPastLimitCommandPassesStraightThrough)
+{
+  // Documents today's behaviour: the driver itself never clamps a command.
+  Pose({.2, .7, .9, -.2, .3, -.4, 1.0});
+  Initialize(JawInfo());
+  ASSERT_EQ(hardware->on_activate(lifecycle), Callback::SUCCESS);
+  Cycle(50);
+  Command(6, 5.8);
+  Cycle(50);
+  EXPECT_NEAR(follower->motor(6).position(), 5.8, .002);
+}
+
+TEST_F(FollowerTest, MalformedSoftLimitsAreRejectedAtInit)
+{
+  auto info = JawInfo(-0.15, 5.88, true, 5.41);
+  info.joints[6].parameters["soft_k_position"] = "0";
+  hardware = std::make_unique<Hardware>();
+  hardware_interface::HardwareComponentInterfaceParams params;
+  params.hardware_info = std::move(info);
+  EXPECT_EQ(hardware->on_init(params), Callback::ERROR);
 }
 
 }  // namespace
