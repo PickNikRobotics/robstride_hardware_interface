@@ -24,6 +24,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <iomanip>
+#include <sstream>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -216,6 +218,11 @@ CallbackReturn RobstrideHardware::on_init(
   soft_prev_cmd_.assign(n, 0.0);
   seen_enabled_.assign(n, false);
   last_recovery_ns_.assign(n, 0);
+  recovery_step_.assign(n, RecoveryStep::Waiting);
+  measured_in_bounds_ = std::vector<std::atomic<bool>>(n);
+  for (auto & bounds : measured_in_bounds_) {
+    bounds.store(false, std::memory_order_relaxed);
+  }
   hw_cmd_effort_.assign(n, 0.0);
   hw_cmd_kp_.assign(n, 0.0);
   hw_cmd_kd_.assign(n, 0.0);
@@ -374,9 +381,64 @@ CallbackReturn RobstrideHardware::on_init(
 
     if (buses_.find(can_if) == buses_.end()) {
       buses_[can_if] = std::make_unique<robstride_sdk::CanBus>(can_if);
+      can_tx_retry_.emplace(can_if, CanTxRetry{});
     }
     buses_[can_if]->RegisterMotor(jh.motor);
   }
+
+  try {
+    const auto file = info_.hardware_parameters.find("relax_safe_poses_file");
+    if (file != info_.hardware_parameters.end()) {
+      std::vector<std::string> names;
+      for (const auto & joint : joints_) {
+        names.push_back(joint.joint_name);
+      }
+      relax_safe_poses_ = LoadRelaxSafePoses(file->second, names);
+      // A named pose's centre must be physically admissible. Its tolerance
+      // may cross a URDF limit (HOME can sit on one); runtime bounds always
+      // intersect the pose check, using the existing feedback-quantum margin.
+      for (const auto & pose : relax_safe_poses_) {
+        for (size_t i = 0; i < n; ++i) {
+          const auto limit = info_.limits.find(joints_[i].joint_name);
+          if (limit != info_.limits.end() && limit->second.has_position_limits &&
+            !PositionWithinBounds(pose.position[i], limit->second.min_position,
+              limit->second.max_position, 0.0))
+          {
+            throw std::invalid_argument("pose '" + pose.name + "' joint '" +
+                    joints_[i].joint_name + "' is outside URDF bounds");
+          }
+          if (joints_[i].control_mode == robstride_sdk::RunMode::RUN_MODE_VELOCITY ||
+            joints_[i].control_mode == robstride_sdk::RunMode::RUN_MODE_CURRENT)
+          {
+            throw std::invalid_argument("relax-safe poses require position-controlled joints");
+          }
+        }
+      }
+      stillness_history_ = std::make_unique<StillnessHistory>(n);
+    }
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR_STREAM(logger_, "Invalid relax_safe_poses_file: " << e.what());
+    return CallbackReturn::ERROR;
+  }
+  measured_hold_ = std::make_unique<MeasuredHold>(n);
+  engage_start_position_.resize(n);
+  torque_feedback_after_ns_.resize(n);
+  torque_hold_sent_.resize(n);
+  measured_feedback_ns_.resize(n);
+  measured_fault_present_.resize(n);
+
+  relaxed_pub_ = this->create_publisher<std_msgs::msg::Bool>(
+    "~/relaxed", rclcpp::QoS(1).reliable().transient_local());
+  relaxation_timer_ = this->create_wall_timer(std::chrono::milliseconds(100), [this]() {
+        std_msgs::msg::Bool message;
+        message.data = relaxed_state_.load(std::memory_order_relaxed);
+        relaxed_pub_->publish(message);
+        if (ignored_relaxed_command_.exchange(false, std::memory_order_relaxed)) {
+          RCLCPP_WARN_THROTTLE(logger_, *this->rclcpp::Node::get_clock(), 5000,
+            "Position/velocity command changed while relaxed; ignored with torque OFF. "
+            "Motion entry points must call ~/engage before sending new commands.");
+        }
+    });
 
   state_pub_ = this->create_publisher<RobstrideStateMsg>(
     "~/robstride_state", rclcpp::SystemDefaultsQoS());
@@ -422,6 +484,14 @@ CallbackReturn RobstrideHardware::on_init(
     "~/set_torque",
     std::bind(
       &RobstrideHardware::SetTorqueCallback, this, std::placeholders::_1, std::placeholders::_2));
+  relax_srv_ = this->create_service<std_srvs::srv::Trigger>(
+    "~/relax",
+    std::bind(&RobstrideHardware::RelaxCallback, this, std::placeholders::_1,
+      std::placeholders::_2));
+  engage_srv_ = this->create_service<std_srvs::srv::Trigger>(
+    "~/engage",
+    std::bind(&RobstrideHardware::EngageCallback, this, std::placeholders::_1,
+      std::placeholders::_2));
   reboot_srv_ = this->create_service<robstride_interfaces::srv::RebootRobstride>(
     "~/reboot_robstride",
     std::bind(
@@ -521,7 +591,14 @@ CallbackReturn RobstrideHardware::on_activate(
 
   // Reactivation is the only way out of a freeze; see read().
   frozen_ = false;
+  measured_hold_->Reset();
+  relaxed_state_.store(false, std::memory_order_relaxed);
+  if (stillness_history_) {stillness_history_->Reset();}
   std::fill(seen_enabled_.begin(), seen_enabled_.end(), false);
+  std::fill(recovery_step_.begin(), recovery_step_.end(), RecoveryStep::Waiting);
+  for (auto & retry : can_tx_retry_) {
+    retry.second.Reset();
+  }
 
   for (auto & kv : buses_) {
     if (!kv.second->Open()) {
@@ -596,7 +673,9 @@ CallbackReturn RobstrideHardware::on_activate(
     const float measured = jh.motor->state().position.load(std::memory_order_relaxed);
     wrap_seeded_[i] = false;  // a fresh activation chooses the turn again
     const double joint_position = JointPosition(i, measured);
-    if (!MeasuredWithinBounds(i, measured)) {
+    const bool in_bounds = MeasuredWithinBounds(i, measured);
+    measured_in_bounds_[i].store(in_bounds, std::memory_order_relaxed);
+    if (!in_bounds) {
       if (torque_enabled_desired_.load(std::memory_order_relaxed)) {
         RCLCPP_ERROR_STREAM(logger_, "Joint '" << jh.joint_name << "' measured position " <<
           joint_position << " is outside its declared bounds; refusing activation");
@@ -772,8 +851,16 @@ return_type RobstrideHardware::read(
   const bool torque_desired = torque_enabled_desired_.load(std::memory_order_relaxed);
   for (size_t i = 0; i < joints_.size(); ++i) {
     const robstride_sdk::MotorState & st = joints_[i].motor->state();
+    // Acquire the complete-feedback stamp before copying its measured fields.
+    // Safe services consume this read() snapshot, never a newer stamp over
+    // an old RT position buffer.
+    measured_feedback_ns_[i] = st.last_feedback_ns.load(std::memory_order_acquire);
+    measured_fault_present_[i] = st.fault_present.load(std::memory_order_relaxed);
     const double dir = joints_[i].direction;
-    hw_state_position_[i] = JointPosition(i, st.position.load(std::memory_order_relaxed));
+    const double motor_position = st.position.load(std::memory_order_relaxed);
+    hw_state_position_[i] = JointPosition(i, motor_position);
+    measured_in_bounds_[i].store(MeasuredWithinBounds(i, motor_position),
+      std::memory_order_relaxed);
     hw_state_velocity_[i] = dir * st.velocity.load(std::memory_order_relaxed);
     hw_state_effort_[i] = dir * st.torque.load(std::memory_order_relaxed);
     hw_state_temperature_[i] = st.temperature.load(std::memory_order_relaxed);
@@ -786,9 +873,14 @@ return_type RobstrideHardware::read(
     // motor has a fresh target the instant it re-engages.
     const bool enabled = IsEnabled(st);
     if (!enabled) {
-      hw_cmd_position_[i] = hw_state_position_[i];
-      hw_cmd_velocity_[i] = 0.0;
-      hw_cmd_effort_[i] = 0.0;
+      measured_hold_->TrackDisabled(i, hw_state_position_[i]);
+      // Keep producer buffers intact in the safe relaxed/hold path. write()
+      // must see a controller's actual command, not a value read() overwrote.
+      if (!measured_hold_->relaxed() && !measured_hold_->holding()) {
+        hw_cmd_position_[i] = hw_state_position_[i];
+        hw_cmd_velocity_[i] = 0.0;
+        hw_cmd_effort_[i] = 0.0;
+      }
       soft_prev_cmd_[i] = hw_state_position_[i];
       // Same for the frozen hold target: a joint that dropped out may have
       // moved while limp, so it must resume holding where it actually is.
@@ -847,6 +939,7 @@ return_type RobstrideHardware::read(
   }
 
   // Services are spun on their own thread; no spin_some() on this cycle.
+  last_read_ns_ = now_ns;
 
   if (!any_lost && !frozen_) {
     return return_type::OK;
@@ -895,12 +988,25 @@ return_type RobstrideHardware::write(
 {
   const double dt = period.seconds() > 0.0 ? period.seconds() : 0.01;
   const uint64_t now_ns = robstride_sdk::NowNs();
+  if (stillness_history_ && is_active_) {
+    stillness_history_->Observe(now_ns, hw_state_position_, hw_state_velocity_,
+      hw_cmd_position_, hw_cmd_velocity_, HealthyForTorque(now_ns));
+  }
+  if (measured_hold_->ObserveCommand(hw_cmd_position_, hw_cmd_velocity_)) {
+    ignored_relaxed_command_.store(true, std::memory_order_relaxed);
+  }
+  ApplyTorqueRequest(now_ns);
+  CheckTorqueTransition(now_ns);
   const bool torque_desired = torque_enabled_desired_.load(std::memory_order_relaxed);
 
   std::unordered_map<std::string, std::vector<can_frame>> frames_by_bus;
+  std::unordered_map<std::string, std::vector<size_t>> frame_joints_by_bus;
+  std::vector<bool> recovery_queued(joints_.size(), false);
+  std::vector<bool> hold_queued(joints_.size(), false);
   for (size_t i = 0; i < joints_.size(); ++i) {
     const JointHandle & jh = joints_[i];
     const robstride_sdk::MotorState & st = jh.motor->state();
+    frame_joints_by_bus[jh.can_interface].push_back(i);
 
     // Apply any gain change parked by SetDataCallback, keeping the service
     // thread away from the buffers this cycle reads.
@@ -926,23 +1032,22 @@ return_type RobstrideHardware::write(
       frames_by_bus[jh.can_interface].push_back(jh.motor->EncodeDisable(false));
       continue;
     }
+    if (!currently_enabled && recovery_step_[i] == RecoveryStep::Waiting &&
+      now_ns - last_recovery_ns_[i] >= kRecoveryResendNs)
+    {
+      recovery_step_[i] = RecoveryStep::Mode;
+    }
+    if (recovery_step_[i] != RecoveryStep::Waiting) {
+      // Progress run_mode -> watchdog -> measured preload -> Enable -> hold
+      // across cycles. Retries repeat only the UNSENT step, not the burst.
+      frames_by_bus[jh.can_interface].push_back(RecoveryFrame(i));
+      recovery_queued[i] = true;
+      continue;
+    }
     if (!currently_enabled) {
-      // Torque wanted but not confirmed: resend Enable, and run_mode with
-      // it, since a brief power loss clears the motor's RAM. Rate-limited,
-      // because this burst every cycle for every joint would exceed what
-      // 1 Mbps CAN can carry when a whole rig recovers at once.
-      if (now_ns - last_recovery_ns_[i] >= kRecoveryResendNs) {
-        last_recovery_ns_[i] = now_ns;
-        frames_by_bus[jh.can_interface].push_back(
-          jh.motor->EncodeParamWriteU8(
-            robstride_sdk::ParamIndex::RUN_MODE, static_cast<uint8_t>(jh.control_mode)));
-        // Also RAM-resident: without re-arming, the motor rejoins with no
-        // watchdog and would hold its last command on the next dropout.
-        frames_by_bus[jh.can_interface].push_back(
-          jh.motor->EncodeParamWriteU32(
-            robstride_sdk::ParamIndex::CAN_TIMEOUT, CanTimeoutRaw(motor_can_timeout_ms_)));
-        frames_by_bus[jh.can_interface].push_back(jh.motor->EncodeEnable());
-      }
+      // While waiting to retry Enable, keep complete feedback fresh with a
+      // measured target, even if firmware's enabled state races this cycle.
+      frames_by_bus[jh.can_interface].push_back(RecoveryFrame(i));
       continue;
     }
 
@@ -961,10 +1066,14 @@ return_type RobstrideHardware::write(
     // driven by writing their own target parameter. While frozen the
     // controllers are not in charge, so hold the captured position.
     // Controllers speak the joint frame; MotorTargetPosition() maps back.
+    const bool seeded_hold = measured_hold_->holding(i);
+    const double command_position = seeded_hold ? measured_hold_->position(i) : hw_cmd_position_[i];
     const double target_position = MotorTargetPosition(
-      i, frozen_ ? freeze_position_[i] : SoftLimitedTarget(i, hw_cmd_position_[i], dt));
-    const double target_velocity = jh.direction * (frozen_ ? 0.0 : hw_cmd_velocity_[i]);
-    const double target_effort = jh.direction * (frozen_ ? 0.0 : hw_cmd_effort_[i]);
+      i, frozen_ ? freeze_position_[i] : SoftLimitedTarget(i, command_position, dt));
+    const double target_velocity =
+      jh.direction * (frozen_ || seeded_hold ? 0.0 : hw_cmd_velocity_[i]);
+    const double target_effort =
+      jh.direction * (frozen_ || seeded_hold ? 0.0 : hw_cmd_effort_[i]);
 
     can_frame frame{};
     switch (jh.control_mode) {
@@ -989,28 +1098,100 @@ return_type RobstrideHardware::write(
           static_cast<float>(target_velocity),
           static_cast<float>(hw_cmd_kp_[i]),
           static_cast<float>(hw_cmd_kd_[i]),
-          static_cast<float>(frozen_ ? 0.0 : MotorFeedforward(jh, hw_cmd_effort_[i])));
+          static_cast<float>(frozen_ || seeded_hold ? 0.0 :
+          MotorFeedforward(jh, hw_cmd_effort_[i])));
         break;
     }
     frames_by_bus[jh.can_interface].push_back(frame);
+    hold_queued[i] = true;
   }
 
   for (auto & kv : frames_by_bus) {
-    const int sent = buses_[kv.first]->SendFrames(kv.second);
-    if (sent == static_cast<int>(kv.second.size())) {
-      continue;
+    const int sent = std::max(0, buses_[kv.first]->SendFrames(kv.second));
+    auto & retry = can_tx_retry_.at(kv.first);
+    const bool complete = sent == static_cast<int>(kv.second.size());
+    retry.Observe(now_ns, complete);
+    // Only successfully queued frames may advance the state machine or
+    // authorize post-frame feedback. sendmmsg can accept a prefix then fail.
+    for (int frame = 0; frame < sent; ++frame) {
+      const size_t i = frame_joints_by_bus[kv.first][frame];
+      if (recovery_queued[i]) {RecoveryFrameQueued(i, now_ns);}
+      const bool first_hold = torque_transition_ == TorqueOperation::Engage && hold_queued[i] &&
+        !torque_hold_sent_[i];
+      if (torque_transition_ == TorqueOperation::Relax && torque_feedback_after_ns_[i] == 0) {
+        torque_feedback_after_ns_[i] = now_ns;
+      } else if (first_hold) {
+        torque_hold_sent_[i] = true;
+        torque_feedback_after_ns_[i] = now_ns;
+      }
     }
-    // Otherwise the joints just go stale and the logs blame the motors.
+    if (complete) {continue;}
     const int err = buses_[kv.first]->last_send_errno();
-    RCLCPP_ERROR_STREAM_THROTTLE(
-      logger_, *this->rclcpp::Node::get_clock(), 1000,
-      "CAN transmit incomplete on '" << kv.first << "': queued " << sent << " of " <<
-        kv.second.size() << " frames (" << (err ? std::strerror(err) : "queue full") << "). " <<
-        "The interface is not draining its transmit queue -- typically bus-off. Adapters "
-        "that report 'Device doesn't support restart from Bus Off' cannot recover on their "
-        "own: re-plug the adapter and re-run scripts/setup_can.sh.");
+    if (retry.Failed(now_ns, err)) {
+      RCLCPP_ERROR_STREAM_THROTTLE(logger_, *this->rclcpp::Node::get_clock(), 1000,
+        "CAN transmit incomplete on '" << kv.first << "': queued " << sent << " of " <<
+          kv.second.size() << " frames (" << (err ? std::strerror(err) : "queue full") <<
+          "). Retry budget exhausted or non-transient write failure -- typically bus-off. "
+          "Adapters without bus-off restart need a re-plug and scripts/setup_can.sh.");
+    } else {
+      RCLCPP_WARN_STREAM_THROTTLE(logger_, *this->rclcpp::Node::get_clock(), 1000,
+        "Transient CAN TX queue pressure on '" << kv.first << "': queued " << sent << " of " <<
+          kv.second.size() << " frames; retrying unsent recovery steps on subsequent cycles " <<
+          "for at most 30 ms (no RT wait)");
+    }
   }
   return return_type::OK;
+}
+
+can_frame RobstrideHardware::RecoveryFrame(size_t i) const
+{
+  const auto & joint = joints_[i];
+  switch (recovery_step_[i]) {
+    case RecoveryStep::Mode:
+      return joint.motor->EncodeParamWriteU8(robstride_sdk::ParamIndex::RUN_MODE,
+          static_cast<uint8_t>(joint.control_mode));
+    case RecoveryStep::Watchdog:
+      return joint.motor->EncodeParamWriteU32(robstride_sdk::ParamIndex::CAN_TIMEOUT,
+          CanTimeoutRaw(motor_can_timeout_ms_));
+    case RecoveryStep::Enable:
+      return joint.motor->EncodeEnable();
+    default:
+      break;
+  }
+  const float position = static_cast<float>(MotorTargetPosition(i, hw_state_position_[i]));
+  switch (joint.control_mode) {
+    case robstride_sdk::RunMode::RUN_MODE_POSITION_PP:
+    case robstride_sdk::RunMode::RUN_MODE_POSITION_CSP:
+      return joint.motor->EncodeParamWriteFloat(robstride_sdk::ParamIndex::LOC_REF, position);
+    case robstride_sdk::RunMode::RUN_MODE_VELOCITY:
+      return joint.motor->EncodeParamWriteFloat(robstride_sdk::ParamIndex::SPD_REF, 0.0f);
+    case robstride_sdk::RunMode::RUN_MODE_CURRENT:
+      return joint.motor->EncodeParamWriteFloat(robstride_sdk::ParamIndex::IQ_REF, 0.0f);
+    default:
+      return joint.motor->EncodeMotionCommand(position, 0.0f,
+          static_cast<float>(hw_cmd_kp_[i]), static_cast<float>(hw_cmd_kd_[i]), 0.0f);
+  }
+}
+
+void RobstrideHardware::RecoveryFrameQueued(size_t i, uint64_t now_ns)
+{
+  switch (recovery_step_[i]) {
+    case RecoveryStep::Mode: recovery_step_[i] = RecoveryStep::Watchdog; break;
+    case RecoveryStep::Watchdog: recovery_step_[i] = RecoveryStep::Preload; break;
+    case RecoveryStep::Preload: recovery_step_[i] = RecoveryStep::Enable; break;
+    case RecoveryStep::Enable:
+      last_recovery_ns_[i] = now_ns;
+      recovery_step_[i] = RecoveryStep::Hold;
+      break;
+    case RecoveryStep::Hold:
+      recovery_step_[i] = RecoveryStep::Waiting;
+      if (torque_transition_ == TorqueOperation::Engage) {
+        torque_hold_sent_[i] = true;
+        torque_feedback_after_ns_[i] = now_ns;
+      }
+      break;
+    case RecoveryStep::Waiting: break;
+  }
 }
 
 double RobstrideHardware::WrapMotorPosition(size_t i, double motor_position)
@@ -1237,9 +1418,16 @@ void RobstrideHardware::SetTorqueCallback(
   const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
   std::shared_ptr<std_srvs::srv::SetBool::Response> response)
 {
-  // Record the desired state only; write() sends the frames, so this does
-  // not race with the RT loop. Deactivate any active controller before
-  // disabling torque, or it keeps holding its setpoint (see README).
+  // Compatibility maintenance path: queue to the writer. The bounds snapshot
+  // is RT-published; this callback never reads mutable coordinate buffers.
+  // This is intentionally NOT the named-pose safe relax API.
+  if (request->data &&
+    torque_request_state_.load(std::memory_order_acquire) != TorqueRequestState::Idle)
+  {
+    response->success = false;
+    response->message = "Previous torque transition requires control-loop cleanup";
+    return;
+  }
   if (request->data && thermal_latch_.tripped()) {
     response->success = false;
     response->message =
@@ -1247,16 +1435,348 @@ void RobstrideHardware::SetTorqueCallback(
     return;
   }
   for (size_t i = 0; request->data && i < joints_.size(); ++i) {
-    const float measured = joints_[i].motor->state().position.load(std::memory_order_relaxed);
-    if (!MeasuredWithinBounds(i, measured)) {
+    if (!measured_in_bounds_[i].load(std::memory_order_relaxed)) {
       response->success = false;
       response->message = "Joint '" + joints_[i].joint_name +
         "' measured position is outside its declared bounds; refusing to enable torque";
       return;
     }
   }
-  torque_enabled_desired_.store(request->data, std::memory_order_relaxed);
+  maintenance_torque_request_.store(request->data ? 1 : 0, std::memory_order_release);
   response->success = true;
+}
+
+bool RobstrideHardware::HealthyForTorque(uint64_t now_ns) const
+{
+  if (!is_active_ || frozen_ || thermal_latch_.tripped() || joints_.empty() ||
+    last_read_ns_ == 0 || ElapsedMsSinceUpdate(now_ns, last_read_ns_) > 100.0)
+  {
+    return false;
+  }
+  for (const auto & bus : buses_) {
+    const int error = bus.second->last_send_errno();
+    if (can_tx_retry_.at(bus.first).Failed(now_ns, error)) {return false;}
+  }
+  const double freshness_ms = std::min(error_timeout_ms_, 100.0);
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    const auto & state = joints_[i].motor->state();
+    const double age = ElapsedMsSinceUpdate(now_ns, measured_feedback_ns_[i]);
+    const auto run_state = static_cast<uint8_t>(hw_state_run_state_[i]);
+    if (age < 0.0 || age > freshness_ms || measured_fault_present_[i] ||
+      state.fault_present.load(std::memory_order_relaxed) ||
+      (run_state != static_cast<uint8_t>(robstride_sdk::RunState::RESET) &&
+      run_state != static_cast<uint8_t>(robstride_sdk::RunState::MOTOR)) ||
+      !std::isfinite(hw_state_position_[i]) || !std::isfinite(hw_state_velocity_[i]) ||
+      !std::isfinite(hw_state_temperature_[i]) || hw_state_temperature_[i] < 0.0)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool RobstrideHardware::AllMeasuredWithinBounds(size_t & outside) const
+{
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    // Bounds and the seeded target refer to the same read() snapshot.
+    if (!measured_in_bounds_[i].load(std::memory_order_relaxed)) {outside = i; return false;}
+  }
+  return true;
+}
+
+void RobstrideHardware::SeedMeasuredCommands()
+{
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    hw_cmd_position_[i] = hw_state_position_[i];
+    soft_prev_cmd_[i] = hw_state_position_[i];
+    freeze_position_[i] = hw_state_position_[i];
+    hw_cmd_velocity_[i] = 0.0;
+    hw_cmd_effort_[i] = 0.0;
+  }
+}
+
+void RobstrideHardware::FinishTorqueRequest(TorqueResult result, size_t index, uint64_t now_ns)
+{
+  const auto transition = torque_transition_;
+  torque_result_.store(result, std::memory_order_relaxed);
+  torque_result_index_.store(index, std::memory_order_relaxed);
+  torque_result_ms_.store(
+    static_cast<double>(now_ns - torque_transition_start_ns_) / 1.0e6,
+    std::memory_order_relaxed);
+  torque_result_max_step_.store(engage_max_step_, std::memory_order_relaxed);
+  torque_transition_ = TorqueOperation::None;
+  // Publish only if the waiter has not timed out. A cancelled waiter leaves
+  // the mailbox unavailable until RT has performed its OFF cleanup.
+  auto state = TorqueRequestState::Active;
+  if (!torque_request_state_.compare_exchange_strong(state, TorqueRequestState::Complete,
+      std::memory_order_release))
+  {
+    state = TorqueRequestState::Applying;
+    if (!torque_request_state_.compare_exchange_strong(state, TorqueRequestState::Complete,
+        std::memory_order_release))
+    {
+      if (transition != TorqueOperation::None) {
+        torque_enabled_desired_.store(false, std::memory_order_relaxed);
+        relaxed_state_.store(false, std::memory_order_relaxed);
+        std::fill(recovery_step_.begin(), recovery_step_.end(), RecoveryStep::Waiting);
+        if (transition == TorqueOperation::Engage) {
+          measured_hold_->AbortEngage(engage_from_relaxed_);
+        }
+      }
+      torque_request_state_.store(TorqueRequestState::Idle, std::memory_order_release);
+    }
+  }
+}
+
+void RobstrideHardware::ApplyTorqueRequest(uint64_t now_ns)
+{
+  const int maintenance = maintenance_torque_request_.exchange(-1, std::memory_order_acquire);
+  if (maintenance >= 0) {
+    size_t outside = 0;
+    if (maintenance == 0 || (!thermal_latch_.tripped() && AllMeasuredWithinBounds(outside))) {
+      torque_enabled_desired_.store(maintenance == 1, std::memory_order_relaxed);
+      measured_hold_->Reset();
+      relaxed_state_.store(false, std::memory_order_relaxed);
+      if (stillness_history_) {stillness_history_->Reset();}
+      std::fill(recovery_step_.begin(), recovery_step_.end(), RecoveryStep::Waiting);
+      if (torque_transition_ != TorqueOperation::None) {
+        FinishTorqueRequest(TorqueResult::TimedOut, 0, now_ns);
+      }
+    }
+  }
+  auto queued = TorqueRequestState::Queued;
+  if (!torque_request_state_.compare_exchange_strong(queued, TorqueRequestState::Applying,
+      std::memory_order_acquire))
+  {
+    if (queued == TorqueRequestState::Cancelled && torque_transition_ == TorqueOperation::None) {
+      torque_request_state_.store(TorqueRequestState::Idle, std::memory_order_release);
+    }
+    return;
+  }
+  const auto request = torque_request_.load(std::memory_order_relaxed);
+  torque_transition_start_ns_ = torque_request_start_ns_.load(std::memory_order_relaxed);
+  torque_transition_deadline_ns_ = torque_request_deadline_ns_.load(std::memory_order_acquire);
+  engage_max_step_ = 0.0;
+  if (now_ns >= torque_transition_deadline_ns_) {
+    FinishTorqueRequest(TorqueResult::TimedOut, 0, now_ns); return;
+  }
+  if (!is_active_) {FinishTorqueRequest(TorqueResult::Inactive, 0, now_ns); return;}
+  if (thermal_latch_.tripped()) {FinishTorqueRequest(TorqueResult::ThermalTrip, 0, now_ns); return;}
+  if (frozen_) {FinishTorqueRequest(TorqueResult::Frozen, 0, now_ns); return;}
+  if (!HealthyForTorque(now_ns)) {FinishTorqueRequest(TorqueResult::Unhealthy, 0, now_ns); return;}
+  size_t outside = 0;
+  if (!AllMeasuredWithinBounds(outside)) {
+    FinishTorqueRequest(TorqueResult::OutOfBounds, outside, now_ns); return;
+  }
+
+  if (request == TorqueOperation::Relax) {
+    if (!stillness_history_) {
+      FinishTorqueRequest(TorqueResult::NotConfigured, 0, now_ns); return;
+    }
+    // Repeated safe relax is permitted, but an unknown/partial torque state
+    // is not a supported-pose permission to disable an otherwise live arm.
+    for (const auto & joint : joints_) {
+      if (!IsEnabled(joint.motor->state()) && !measured_hold_->relaxed()) {
+        FinishTorqueRequest(TorqueResult::Unhealthy, 0, now_ns); return;
+      }
+    }
+    const auto verdict = stillness_history_->Check(relax_safe_poses_, hw_state_position_);
+    TorqueResult result = TorqueResult::Confirmed;
+    switch (verdict.check) {
+      case RelaxCheck::Safe: break;
+      case RelaxCheck::NotConfigured: result = TorqueResult::NotConfigured; break;
+      case RelaxCheck::PoseMismatch: result = TorqueResult::PoseMismatch; break;
+      case RelaxCheck::HistoryMissing: result = TorqueResult::HistoryMissing; break;
+      case RelaxCheck::MeasuredMoving: result = TorqueResult::MeasuredMoving; break;
+      case RelaxCheck::CommandMoving: result = TorqueResult::CommandMoving; break;
+      case RelaxCheck::Unhealthy: result = TorqueResult::Unhealthy; break;
+    }
+    if (result != TorqueResult::Confirmed) {
+      FinishTorqueRequest(result, verdict.pose, now_ns); return;
+    }
+    relaxed_pose_ = verdict.pose;
+    measured_hold_->Relax(hw_cmd_position_, hw_cmd_velocity_);
+    torque_enabled_desired_.store(false, std::memory_order_relaxed);
+    relaxed_state_.store(false, std::memory_order_relaxed);
+    std::fill(recovery_step_.begin(), recovery_step_.end(), RecoveryStep::Waiting);
+  } else {
+    for (const auto & joint : joints_) {
+      if (joint.control_mode == robstride_sdk::RunMode::RUN_MODE_VELOCITY ||
+        joint.control_mode == robstride_sdk::RunMode::RUN_MODE_CURRENT)
+      {
+        FinishTorqueRequest(TorqueResult::Unhealthy, 0, now_ns); return;
+      }
+    }
+    const bool already_enabled = std::all_of(joints_.begin(), joints_.end(),
+        [](const auto & joint) {return IsEnabled(joint.motor->state());});
+    if (torque_enabled_desired_.load(std::memory_order_relaxed) && already_enabled) {
+      // Idempotent entry gate: no torque transition or reseed is performed.
+      FinishTorqueRequest(TorqueResult::AlreadyEngaged, 0, now_ns); return;
+    }
+    for (const auto & joint : joints_) {
+      if (IsEnabled(joint.motor->state())) {
+        FinishTorqueRequest(TorqueResult::Unhealthy, 0, now_ns); return;
+      }
+    }
+    engage_from_relaxed_ = measured_hold_->relaxed();
+    std::copy(hw_state_position_.begin(), hw_state_position_.end(), engage_start_position_.begin());
+    measured_hold_->Engage(hw_state_position_, hw_cmd_position_, hw_cmd_velocity_);
+    relaxed_state_.store(false, std::memory_order_relaxed);
+    SeedMeasuredCommands();
+    torque_enabled_desired_.store(true, std::memory_order_relaxed);
+    std::fill(seen_enabled_.begin(), seen_enabled_.end(), false);
+    std::fill(last_recovery_ns_.begin(), last_recovery_ns_.end(), 0);
+    std::fill(recovery_step_.begin(), recovery_step_.end(), RecoveryStep::Mode);
+  }
+  torque_transition_ = request;
+  std::fill(torque_feedback_after_ns_.begin(), torque_feedback_after_ns_.end(), 0);
+  std::fill(torque_hold_sent_.begin(), torque_hold_sent_.end(), false);
+  auto applying = TorqueRequestState::Applying;
+  torque_request_state_.compare_exchange_strong(applying, TorqueRequestState::Active,
+    std::memory_order_release);
+}
+
+void RobstrideHardware::CheckTorqueTransition(uint64_t now_ns)
+{
+  if (torque_transition_ == TorqueOperation::None) {return;}
+  const bool engaging = torque_transition_ == TorqueOperation::Engage;
+  TorqueResult failure = TorqueResult::Confirmed;
+  size_t outside = 0;
+  if (now_ns >= torque_transition_deadline_ns_ ||
+    torque_request_state_.load(std::memory_order_acquire) == TorqueRequestState::Cancelled)
+  {
+    failure = TorqueResult::TimedOut;
+  } else if (!is_active_) {
+    failure = TorqueResult::Inactive;
+  } else if (!HealthyForTorque(now_ns)) {
+    failure = TorqueResult::Unhealthy;
+  } else if (engaging && !AllMeasuredWithinBounds(outside)) {
+    failure = TorqueResult::OutOfBounds;
+  }
+  if (engaging) {
+    for (size_t i = 0; i < joints_.size(); ++i) {
+      engage_max_step_ = std::max(engage_max_step_,
+          std::abs(hw_state_position_[i] - engage_start_position_[i]));
+    }
+  }
+  if (failure != TorqueResult::Confirmed) {
+    // Partial enable or uncertain feedback never retries after failure. OFF
+    // frames are scheduled by this same writer, and only an explicit call
+    // may try again. Relax failure also leaves the requested OFF state.
+    torque_enabled_desired_.store(false, std::memory_order_relaxed);
+    std::fill(seen_enabled_.begin(), seen_enabled_.end(), false);
+    std::fill(recovery_step_.begin(), recovery_step_.end(), RecoveryStep::Waiting);
+    if (engaging) {
+      measured_hold_->AbortEngage(engage_from_relaxed_);
+    }
+    // An unconfirmed transition is not an attestation of supported/all-OFF
+    // rest, even though the writer continues requesting OFF for every motor.
+    relaxed_state_.store(false, std::memory_order_relaxed);
+    FinishTorqueRequest(failure, outside, now_ns); return;
+  }
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    const bool enabled = hw_state_run_state_[i] ==
+      static_cast<uint8_t>(robstride_sdk::RunState::MOTOR);
+    if (torque_feedback_after_ns_[i] == 0 ||
+      measured_feedback_ns_[i] <= torque_feedback_after_ns_[i] ||
+      (engaging && !torque_hold_sent_[i]) || enabled != engaging)
+    {
+      return;
+    }
+  }
+  if (engaging) {measured_hold_->ConfirmEngaged();}
+  relaxed_state_.store(!engaging, std::memory_order_relaxed);
+  FinishTorqueRequest(TorqueResult::Confirmed, relaxed_pose_, now_ns);
+}
+
+bool RobstrideHardware::RequestTorque(TorqueOperation operation, std::string & message)
+{
+  if (torque_request_state_.load(std::memory_order_acquire) != TorqueRequestState::Idle) {
+    message = "Previous torque transition is still pending; control-loop confirmation required";
+    return false;
+  }
+  const double timeout_s = std::clamp(error_timeout_ms_ / 1000.0, 0.5, 2.0);
+  const auto start_ns = robstride_sdk::NowNs();
+  const auto deadline = start_ns + static_cast<uint64_t>(timeout_s * 1.0e9);
+  torque_request_start_ns_.store(start_ns, std::memory_order_relaxed);
+  torque_request_deadline_ns_.store(deadline, std::memory_order_relaxed);
+  torque_request_.store(operation, std::memory_order_relaxed);
+  torque_request_state_.store(TorqueRequestState::Queued, std::memory_order_release);
+  while (torque_request_state_.load(std::memory_order_acquire) != TorqueRequestState::Complete &&
+    rclcpp::ok() && robstride_sdk::NowNs() < deadline + 50'000'000ull)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  auto state = torque_request_state_.load(std::memory_order_acquire);
+  while (state != TorqueRequestState::Complete) {
+    if (state == TorqueRequestState::Queued) {
+      // Claim queued cancellation atomically; RT cannot consume it now.
+      if (torque_request_state_.compare_exchange_weak(state, TorqueRequestState::Idle)) {break;}
+    } else if (torque_request_state_.compare_exchange_weak(state, TorqueRequestState::Cancelled)) {
+      break;
+    }
+  }
+  if (state != TorqueRequestState::Complete) {
+    message = "Torque transition timed out without control-loop confirmation; "
+      "state is unconfirmed and any partial engage will be disabled when updates resume";
+    return false;
+  }
+  const auto result = torque_result_.load(std::memory_order_relaxed);
+  torque_request_state_.store(TorqueRequestState::Idle, std::memory_order_release);
+  switch (result) {
+    case TorqueResult::Confirmed:
+    case TorqueResult::AlreadyEngaged: {
+        std::ostringstream text;
+        text << std::fixed << std::setprecision(3);
+        if (result == TorqueResult::AlreadyEngaged) {
+          text << "Already engaged; no torque transition; ";
+        } else if (operation == TorqueOperation::Relax) {
+          text << "Relaxed at pose '" << relax_safe_poses_[torque_result_index_.load()].name <<
+            "'; ";
+        } else {
+          text << "Engaged measured-pose hold; ";
+        }
+        text << "all " << joints_.size() << " joints confirmed; elapsed_ms=" <<
+          torque_result_ms_.load() << "; max_step_rad=" << std::setprecision(6) <<
+          torque_result_max_step_.load();
+        message = text.str();
+        return true;
+      }
+    case TorqueResult::Inactive: message = "Hardware is inactive"; break;
+    case TorqueResult::NotConfigured: message = "No relax_safe_poses_file configured"; break;
+    case TorqueResult::PoseMismatch: message = "Measured pose matches no relax-safe pose"; break;
+    case TorqueResult::HistoryMissing: message = "Complete stillness window not available"; break;
+    case TorqueResult::MeasuredMoving: message = "Measured joints are not stationary"; break;
+    case TorqueResult::CommandMoving:
+      message = "Position/velocity commands are not stationary";
+      break;
+    case TorqueResult::Unhealthy:
+      message = "Hardware unhealthy: fresh complete fault-free feedback required";
+      break;
+    case TorqueResult::OutOfBounds:
+      message = "Joint '" + joints_[torque_result_index_.load()].joint_name +
+        "' measured position is outside its declared bounds"; break;
+    case TorqueResult::ThermalTrip: message = "Thermal trip latched"; break;
+    case TorqueResult::Frozen: message = "Hardware is frozen; fresh activation required"; break;
+    case TorqueResult::TimedOut:
+      message = "Torque transition timed out; all joints requested OFF";
+      break;
+  }
+  return false;
+}
+
+void RobstrideHardware::RelaxCallback(
+  const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+  response->success = RequestTorque(TorqueOperation::Relax, response->message);
+}
+
+void RobstrideHardware::EngageCallback(
+  const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+  response->success = RequestTorque(TorqueOperation::Engage, response->message);
 }
 
 void RobstrideHardware::RebootCallback(

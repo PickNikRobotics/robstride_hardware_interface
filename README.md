@@ -43,9 +43,9 @@ RobStride motors run at 1 Mbps. Bring each interface up before launching:
 ./scripts/setup_can.sh can0 1000000 1000    # explicit bitrate / txqueuelen
 ```
 
-`txqueuelen` matters: activation sends a burst of several frames per motor, and the kernel default of 10 is small enough to drop most of it on a rig of any size.
+The enable sequence (run_mode, watchdog, measured preload, Enable, hold) is paced one frame per motor per control cycle, so engage and recovery fit the kernel default `txqueuelen` of 10 on a seven-motor bus. A longer queue is optional headroom. `ENOBUFS`/`EAGAIN` from a short burst is treated as transient: unsent steps repeat on later cycles, and the bus blocks torque only if no complete send succeeds within 30 ms or the error is non-transient.
 
-Many gs_usb/candlelight adapters do not support bus-off auto-recovery (`restart-ms`); the script detects this and continues without it. On those adapters a bus-off event needs a manual `down`/`up` cycle, or the adapter re-plugged. The symptom is `SendFrames()` failing with `ENOBUFS` while the interface still reports `UP`, which the plugin logs explicitly rather than letting it surface as every motor going silent.
+Many gs_usb/candlelight adapters do not support bus-off auto-recovery (`restart-ms`); the script detects this and continues without it. On those adapters a bus-off event needs a manual `down`/`up` cycle, or the adapter re-plugged. The symptom is `SendFrames()` failing with `ENOBUFS` for longer than the 30 ms retry budget while the interface still reports `UP`, which the plugin logs explicitly rather than letting it surface as every motor going silent.
 
 ## 5. Configuration
 
@@ -60,6 +60,7 @@ Many gs_usb/candlelight adapters do not support bus-off auto-recovery (`restart-
 | `freeze_on_joint_loss` | See §6 | `true` |
 | `torque_enable` | Whether activation engages torque. `false` brings the rig up readable but limp: joints report state and can be moved by hand until `~/set_torque` is called | `true` |
 | `hold_torque_on_deactivate` | Whether `on_deactivate()` leaves torque engaged. `false` disables every motor, which drops a gravity-loaded arm wherever it is standing. `true` holds the pose through a clean stop, and then only while `motor_can_timeout_ms` is `0` — an armed motor watchdog releases torque that long after the bus goes quiet, whatever this is set to. `on_init()` warns on that combination | `false` |
+| `relax_safe_poses_file` | Absolute path to the robot workspace's version-1 named relax-safe poses YAML. Parsed once at initialization; invalid configuration prevents startup. Without it, `~/relax` refuses. No pose, including HOME, is built into the driver | (unset) |
 
 ### Joints and gpios
 
@@ -237,6 +238,80 @@ has received a gain or reached a pose.
 
 `~/set_zero_robstride` is the more dangerous of the two, for a different reason. It moves nothing itself, but it redefines what zero means at the joint's current position. If a controller is holding a setpoint of, say, `3.0` at that moment, the physical spot that used to read `3.0` now reads `0.0`, and the controller — still chasing the literal number — drives the motor somewhere new to match. The motion comes entirely from the controller reacting to the reference frame shifting underneath it.
 
+### Safe relax / measured-pose engage
+
+`~/relax` and `~/engage` are `std_srvs/srv/Trigger` services; they leave the driver
+and controllers running. Use them for supported idle rest, not the broad
+maintenance `~/set_torque` switch above. Motors have **no brakes**: a relax-safe
+pose must have an attended torque-off/support/settle qualification before it is
+added to the robot workspace. Collision-free is not the same as safe without torque.
+
+The workspace supplies `relax_safe_poses_file` from its ros2_control xacro. The
+version-1 schema has a `relax_safe_poses` list; each entry contains `name`,
+`joints: {<joint>: {position_rad: <rad>, tolerance_rad: <rad>}, ...}` and
+`stillness: {window_s: <s>, max_span_rad: <rad>, max_abs_velocity_rad_s: <rad/s>}`.
+Every configured joint must occur exactly once. Pose names must be unique;
+positions must be finite; tolerances/stillness thresholds must be finite and
+positive; `window_s` is at most 10 s. `max_abs_velocity_rad_s` defaults to 0.01
+when omitted. Unknown/duplicate keys, unsupported versions and multiple YAML
+documents are rejected. Pose centres must be inside the URDF limits. A tolerance
+box may overlap a limit because a supported pose can sit on it; runtime measured
+bounds **intersect** the pose box, never widen the existing limit check.
+
+Relax checks **all configured joints** (all seven on reBot) in the RT writer:
+
+- Active, unfrozen hardware; clear thermal latch; complete Type-2 feedback at
+  most `min(error_timeout_ms, 100)` ms old; finite measured state; no current
+  fault, invalid run state or CAN transmit error. Historical `fault_bits` remain
+  diagnostic history, not a new current fault after healthy Type-2 feedback.
+- Every measured position matches one named pose within its own inclusive
+  tolerance **and** passes the existing measured-URDF-bounds check.
+- A complete healthy measured window has per-joint position span no greater
+  than `max_span_rad`, and the window's least-squares measured-position slope is
+  no greater than `max_abs_velocity_rad_s`. Raw motor velocity feedback is only
+  required to be finite: at rest it reads up to about 0.15 rad/s while position
+  stays within one feedback quantum, so it cannot gate stillness.
+- Over the same window, each position command's span is at most 0.0001 rad
+  and each velocity command is at most 0.0001 rad/s in absolute value. Effort-only
+  gravity compensation is not treated as a motion producer. History overflow,
+  activation, or an update gap greater than 100 ms requires a new full window.
+
+A precondition refusal leaves desired torque unchanged. Once accepted, the
+writer requests Disable for every motor; success waits for fresh all-OFF
+feedback and names the matched pose. Changed position/velocity commands while
+relaxed are ignored, warned about on the service executor, and **never** cause
+automatic enable. `~/relaxed` reports a successfully confirmed safe relax;
+false includes engaged, transitioning, and failed/unconfirmed states.
+
+Engage checks fresh healthy feedback, the thermal/freeze gates and existing
+measured bounds. From a readable all-OFF start or safe relax, it seeds position,
+soft-limit state and hold from the measured pose, zeros velocity/effort, preloads
+closed-loop motor targets before Enable, and waits for all motors to confirm
+with post-target feedback. The measured hold stays latched **per joint** against
+repeated obsolete controller setpoints (and the hardware's own reseed). Only a
+new finite position/velocity command **after** confirmation releases that joint's
+hold; a jaw command cannot release stale arm references. Effort alone cannot
+release it. An already healthy, in-bounds all-ON request succeeds idempotently
+without reseeding or interrupting current motion. Partial enable, stale feedback
+or timeout fails and requests all OFF with no automatic retry.
+
+**Motion entry points must await `~/engage` success before issuing new motion.**
+Complete/cancel trajectory or leader following before relax. Command stillness
+is the driver's observable gate, not proof that no future trajectory is queued;
+the driver cannot inspect arbitrary Objective/action status. Orchestration must
+quiesce those producers. In particular, do not submit motion while relaxed and
+expect engage to resume it. Reissue a new command after the successful response.
+
+The service executor only submits an atomic mailbox and waits (0.5–2 s deadline,
+plus 50 ms confirmation grace). `read()`/`write()` never wait for that callback,
+parse YAML, format responses, or wait for a motor reply. Results report
+`elapsed_ms` from submission to all-motor confirmation and `max_step_rad`, the
+largest observed displacement from the engage seed through confirmation; this
+is sampled feedback, not a physical no-motion certification. A stopped RT loop
+expires queued requests so they cannot enable later; an already partial engage
+is requested OFF when updates resume. A failed/unconfirmed state requires
+inspection, not an assumption that every motor received Disable.
+
 ## 8. Topics and services
 
 All under the hardware component's own node namespace (`~`):
@@ -247,7 +322,10 @@ All under the hardware component's own node namespace (`~`):
 | `~/get_data_from_robstride` | `robstride_interfaces/srv/GetDataFromRobstride` | Read live telemetry for one motor |
 | `~/set_data_to_robstride` | `robstride_interfaces/srv/SetDataToRobstride` | Set `kp`/`kd`, or write an arbitrary parameter index. A `kp`/`kd` success means the gain was queued for the next motion frame, not that the motor applied it: motion-mode gains have no motor readback, and `get_data_from_robstride` returns `result: false` for them |
 | `~/set_zero_robstride` | `robstride_interfaces/srv/SetZeroRobstride` | Set a motor's mechanical zero |
-| `~/set_torque` | `std_srvs/srv/SetBool` | Enable/disable all configured motors |
+| `~/set_torque` | `std_srvs/srv/SetBool` | Queue a maintenance enable/disable for all configured motors. Success means queued, not motor-state confirmation; enable bounds are rechecked by the writer |
+| `~/relax` | `std_srvs/srv/Trigger` | Named-pose, healthy measured/commanded stillness gate; request all OFF and report the pose only after confirmation |
+| `~/engage` | `std_srvs/srv/Trigger` | Bounds-checked measured-pose hold, all-ON confirmation, elapsed ms and max observed step |
+| `~/relaxed` | `std_msgs/msg/Bool` | Confirmed safe-relax state, reliable/transient-local depth 1, published at 10 Hz on the service executor |
 | `~/reboot_robstride` | `robstride_interfaces/srv/RebootRobstride` | Clear a motor's latched fault. Unconditional: the caller decides which faults are safe to clear. The joint re-enables only after the hardware is reactivated (see §6). |
 
 See [robstride_interfaces' README](https://github.com/kmj060703/robstride_interfaces/blob/main/README.md) for field descriptions.
@@ -258,7 +336,7 @@ This plugin inherits `rclcpp::Node` for the services above, so it has to spin it
 
 An earlier version called `rclcpp::spin_some()` at the end of `read()` instead. That ran every callback synchronously inside the RT cycle, and a callback that blocked for a few seconds froze `read()`/`write()` for that whole duration — long enough for the resulting CAN silence to trip this plugin's own staleness check and force-deactivate the hardware.
 
-The tradeoff is that state shared between a callback and the RT cycle is now touched by two genuinely concurrent threads. Service callbacks must not write the RT cycle's plain buffers directly; they park values in an atomic that `write()` picks up (see `pending_kp_` and `torque_enabled_desired_`).
+The tradeoff is that state shared between a callback and the RT cycle is now touched by two genuinely concurrent threads. Service callbacks must not write the RT cycle's plain buffers directly; they park values in an atomic that `write()` picks up (see `pending_kp_`, `maintenance_torque_request_` and `torque_request_`). Safe torque requests are validated and confirmed by the RT writer, with results published through an atomic completion flag; only the service thread waits.
 
 ## 10. Bus bandwidth
 
@@ -279,6 +357,14 @@ If utilization is near saturation, or staleness errors appear under load, reduce
 ## 11. Virtual CAN qualification
 
 `test_fake_follower` drives the real lifecycle against seven fake RobStride motors (IDs 1–7, host 253) on a kernel `vcan` link: activation from measured state, out-of-bounds refusal, fault versus link loss, a silent joint and the latched freeze, failed and successful reactivation, the 100 °C latch, fault bit 14 under a static hold, gain write versus readback, transmit failure, truncated feedback, torque off, shutdown, position modes and the motor watchdog. `test_joint_coordinates` covers bounds, signs, whole-turn offsets and continuous wrap without CAN encoding. The fake is an independent wire implementation and is not a thermal, load or friction model.
+
+`test_relaxation` covers strict configuration loading, every joint's tolerance,
+measured/commanded stillness, missing/gapped/overrun history, nonfinite/health
+refusals, and the per-joint measured hold. `test_relax_services` calls the actual
+Trigger services against seven virtual motors: supported release, OFF/ON
+confirmation, manual settle, an active controller's stale reference, jaw-only
+and new motion, ignored-command warnings, bounds/health/thermal gates, partial
+and expired enable, position-mode preloads, and timing/step evidence.
 
 The tests open only a link whose kernel kind is `vcan`; a physical interface renamed `vcan0` is refused. `test/with_vcan.py` creates and removes the link and sets `ROBSTRIDE_REQUIRE_VCAN=1`, so a missing link fails instead of skipping. Run it in a separate network namespace with `CAP_NET_ADMIN`, for example a container started with `--network none --cap-add NET_ADMIN`:
 
@@ -307,9 +393,10 @@ re-enable a motor that drops out. Hot initial feedback prevents startup enable.
 A runtime consumer must stop the active task, return to the robot's supported
 rest pose, verify fresh measured rest, and only then use the existing
 `~/set_torque` service to switch torque off. If recovery or state freshness
-fails, keep torque engaged and report intervention required. The driver has no
-knowledge of a robot's HOME pose. Existing motor fault and communication-loss
-handling remains in force.
+fails, keep torque engaged and report intervention required. The maintenance
+torque switch has no knowledge of HOME; the safe `~/relax` service instead uses
+configured named poses and refuses while the thermal latch is set. Existing
+motor fault and communication-loss handling remains in force.
 
 After successful recovery, the runtime may attest fresh measured rest through
 `~/thermal_rest_verified` (`std_msgs/msg/UInt64`, reliable, volatile, depth 1).
@@ -323,7 +410,9 @@ a finite nonnegative temperature strictly below `thermal_clear_c` (default
 cutoff. Missing, invalid, future or stale feedback cannot clear; fault frames
 cannot refresh temperature freshness. The runtime must never attest rest after
 failed recovery or stale/off-rest measurements, and must refresh the attestation
-while waiting for cooling. This generic driver cannot verify the robot's HOME.
+while waiting for cooling. The thermal-rest attestation remains an external
+recovery contract; the optional safe-relax configuration does not change its
+clear rules.
 
 Clearing publishes false and leaves torque requested OFF. Only an explicit
 operator HOME-enable procedure and a newly started Objective may re-engage;
