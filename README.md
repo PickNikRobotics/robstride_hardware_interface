@@ -86,7 +86,7 @@ gpio params:
 | `can_interface` | SocketCAN interface this motor is on. Motors may use different buses, e.g. one per quadruped leg. |
 | `actuator_type` | `"00"`..`"06"`, `"0"`..`"6"`, or `"RS00"`..`"RS06"` |
 | `control_mode` | `motion` (default), `position_pp`, `velocity`, `current`, `position_csp` |
-| `kp`, `kd` | Initial gains. `motion` mode only; the other modes are closed by the motor's own loops. |
+| `kp`, `kd` | Initial gains, restored by every `~/engage` from OFF (§7). `motion` mode only; the other modes are closed by the motor's own loops. |
 | `direction` | `1` (default) or `-1`. Joint frame = `direction` × motor frame for position, velocity and effort, so a motor mounted opposite to the URDF axis needs no model change. Raw parameter writes through `~/set_data_to_robstride` stay in the motor frame. |
 | `max_feedforward_effort` | `motion` mode only. Bound (N·m, joint frame) on the torque feedforward taken from the joint's `effort` command. Defaults to a quarter of the model's torque range: 3.5 N·m on an RS00 and 9 N·m on an RS06, below their 5 and 11 N·m rated torque. |
 
@@ -291,8 +291,11 @@ with post-target feedback. The measured hold stays latched **per joint** against
 repeated obsolete controller setpoints (and the hardware's own reseed). Only a
 new finite position/velocity command **after** confirmation releases that joint's
 hold; a jaw command cannot release stale arm references. Effort alone cannot
-release it. An already healthy, in-bounds all-ON request succeeds idempotently
-without reseeding or interrupting current motion. Partial enable, stale feedback
+release it. Engage from OFF also restores every motor's URDF `kp`/`kd`, discarding
+runtime gain writes, including any queued while relaxed; the response then reports
+`restored configured kp/kd`. A float mode that lowered stiffness therefore does
+not outlive relax and re-engage. An already healthy, in-bounds all-ON request succeeds idempotently
+without reseeding, changing gains or interrupting current motion. Partial enable, stale feedback
 or timeout fails and requests all OFF with no automatic retry.
 
 **Motion entry points must await `~/engage` success before issuing new motion.**
@@ -364,7 +367,8 @@ refusals, and the per-joint measured hold. `test_relax_services` calls the actua
 Trigger services against seven virtual motors: supported release, OFF/ON
 confirmation, manual settle, an active controller's stale reference, jaw-only
 and new motion, ignored-command warnings, bounds/health/thermal gates, partial
-and expired enable, position-mode preloads, and timing/step evidence.
+and expired enable, position-mode preloads, configured-gain restore after
+runtime kp/kd writes, and timing/step evidence.
 
 The tests open only a link whose kernel kind is `vcan`; a physical interface renamed `vcan0` is refused. `test/with_vcan.py` creates and removes the link and sets `ROBSTRIDE_REQUIRE_VCAN=1`, so a missing link fails instead of skipping. Run it in a separate network namespace with `CAP_NET_ADMIN`, for example a container started with `--network none --cap-add NET_ADMIN`:
 

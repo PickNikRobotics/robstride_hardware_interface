@@ -152,6 +152,10 @@ private:
   // <gpio> interfaces: runtime-writable gains and per-motor health.
   std::vector<double> hw_cmd_kp_;
   std::vector<double> hw_cmd_kd_;
+  // URDF gains from on_init(); engage from OFF restores them (see RestoreConfiguredGains).
+  std::vector<double> configured_kp_;
+  std::vector<double> configured_kd_;
+  std::atomic<bool> gains_restored_{false};
   std::vector<double> hw_state_temperature_;
   std::vector<double> hw_state_run_state_;
   std::vector<double> hw_state_fault_bits_;
@@ -295,6 +299,7 @@ private:
   bool HealthyForTorque(uint64_t now_ns) const;
   bool AllMeasuredWithinBounds(size_t & outside) const;
   void SeedMeasuredCommands();
+  void RestoreConfiguredGains();
   can_frame RecoveryFrame(size_t i) const;
   void RecoveryFrameQueued(size_t i, uint64_t now_ns);
   void RebootCallback(

@@ -30,6 +30,7 @@
 #include "hardware_interface/types/hardware_component_interface_params.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "robstride_hardware_interface/robstride_hardware_interface.hpp"
+#include "robstride_interfaces/srv/set_data_to_robstride.hpp"
 #include "fake_robstride_motor.hpp"
 #include "vcan_tx_queue.hpp"
 
@@ -39,6 +40,7 @@ using Hardware = robstride_hardware_interface::RobstrideHardware;
 using Callback = hardware_interface::CallbackReturn;
 using Return = hardware_interface::return_type;
 using Trigger = std_srvs::srv::Trigger;
+using SetData = robstride_interfaces::srv::SetDataToRobstride;
 using Values = std::array<double, 7>;
 using namespace std::chrono_literals;
 
@@ -179,6 +181,21 @@ protected:
       ADD_FAILURE() << "timeout " << endpoint; return nullptr;
     }
     return future.get();
+  }
+  bool SetGain(uint8_t id, const std::string & gain, float value)
+  {
+    auto client = observer->create_client<SetData>(
+      "/robstride_hardware_interface/set_data_to_robstride");
+    if (!client->wait_for_service(2s)) {ADD_FAILURE() << "missing set_data"; return false;}
+    auto request = std::make_shared<SetData::Request>();
+    request->id = id; request->item_name = gain; request->item_data = value;
+    auto future = client->async_send_request(request);
+    if (rclcpp::spin_until_future_complete(observer, future, 2s) !=
+      rclcpp::FutureReturnCode::SUCCESS)
+    {
+      ADD_FAILURE() << "timeout set_data"; return false;
+    }
+    return future.get()->result;
   }
   void Off() {for (size_t i = 0; i < 7; ++i) {EXPECT_FALSE(follower->motor(i).enabled()) << i;}}
   void On() {for (size_t i = 0; i < 7; ++i) {EXPECT_TRUE(follower->motor(i).enabled()) << i;}}
@@ -607,4 +624,56 @@ int main(int argc, char ** argv)
   const int result = RUN_ALL_TESTS();
   rclcpp::shutdown();
   return result;
+}
+
+TEST_F(RelaxServices, EngageFromOffRestoresConfiguredGainsAfterRuntimeGainWrites)
+{
+  Initialize();
+  repeat_controller = true;
+  Cycle(200);
+  // A float mode (reBot Start Gravity Comp) writes arm gains at runtime.
+  for (uint8_t id = 1; id <= 6; ++id) {
+    ASSERT_TRUE(SetGain(id, "kd", 1.0f));
+    ASSERT_TRUE(SetGain(id, "kp", 0.0f));
+  }
+  Cycle(150);
+  for (size_t i = 0; i < 6; ++i) {
+    EXPECT_NEAR(follower->motor(i).applied_kp(), 0, .1) << i;
+    EXPECT_NEAR(follower->motor(i).applied_kd(), 1, .01) << i;
+  }
+  EXPECT_NEAR(follower->motor(6).applied_kp(), 50, .1) << "jaw untouched";
+  const auto released = Call("relax");
+  ASSERT_TRUE(released && released->success) << (released ? released->message : "no reply");
+  Off();
+  // A gain queued while relaxed is not carried into the next engage either.
+  ASSERT_TRUE(SetGain(2, "kp", 0.0f));
+  Cycle(150);
+  const auto engaged = Call("engage");
+  ASSERT_TRUE(engaged && engaged->success) << (engaged ? engaged->message : "no reply");
+  EXPECT_NE(engaged->message.find("restored configured kp/kd"), std::string::npos) <<
+    engaged->message;
+  On();
+  Cycle(150);
+  for (size_t i = 0; i < 7; ++i) {
+    EXPECT_NEAR(follower->motor(i).applied_kp(), 50, .1) << i;
+    EXPECT_NEAR(follower->motor(i).applied_kd(), 3, .01) << i;
+  }
+  // Engage is not a gain lock: a later runtime write still applies, and an
+  // idempotent engage while already ON leaves it in place.
+  ASSERT_TRUE(SetGain(1, "kp", 20.0f));
+  Cycle(100);
+  EXPECT_NEAR(follower->motor(0).applied_kp(), 20, .1);
+  const auto again = Call("engage");
+  ASSERT_TRUE(again && again->success);
+  EXPECT_NE(again->message.find("Already engaged"), std::string::npos) << again->message;
+  Cycle(100);
+  EXPECT_NEAR(follower->motor(0).applied_kp(), 20, .1);
+  // Engage from OFF with unchanged gains does not claim a restore.
+  ASSERT_TRUE(SetGain(1, "kp", 50.0f));
+  Cycle(250);
+  ASSERT_TRUE(Call("relax")->success);
+  Off();
+  const auto plain = Call("engage");
+  ASSERT_TRUE(plain && plain->success);
+  EXPECT_EQ(plain->message.find("restored configured"), std::string::npos) << plain->message;
 }
