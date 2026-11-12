@@ -226,6 +226,8 @@ CallbackReturn RobstrideHardware::on_init(
   hw_cmd_effort_.assign(n, 0.0);
   hw_cmd_kp_.assign(n, 0.0);
   hw_cmd_kd_.assign(n, 0.0);
+  configured_kp_.assign(n, 0.0);
+  configured_kd_.assign(n, 0.0);
   hw_state_temperature_.assign(n, 0.0);
   hw_state_run_state_.assign(n, 0.0);
   hw_state_fault_bits_.assign(n, 0.0);
@@ -292,6 +294,8 @@ CallbackReturn RobstrideHardware::on_init(
       jh.control_mode = robstride_sdk::RunModeFromString(GetJointParam(*gpio, "control_mode", ""));
       hw_cmd_kp_[i] = std::stod(GetJointParam(*gpio, "kp", "0.0"));
       hw_cmd_kd_[i] = std::stod(GetJointParam(*gpio, "kd", "0.0"));
+      configured_kp_[i] = hw_cmd_kp_[i];
+      configured_kd_[i] = hw_cmd_kd_[i];
       jh.direction = std::stod(GetJointParam(*gpio, "direction", "1"));
       if (jh.direction != 1.0 && jh.direction != -1.0) {
         throw std::invalid_argument("direction must be 1 or -1");
@@ -1495,6 +1499,21 @@ void RobstrideHardware::SeedMeasuredCommands()
   }
 }
 
+void RobstrideHardware::RestoreConfiguredGains()
+{
+  // Engage from OFF always starts from the URDF gains. Runtime kp/kd writes
+  // (e.g. a float mode) otherwise outlive relax and re-engage until restart.
+  bool changed = false;
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    has_pending_kp_[i].store(false, std::memory_order_relaxed);
+    has_pending_kd_[i].store(false, std::memory_order_relaxed);
+    changed |= hw_cmd_kp_[i] != configured_kp_[i] || hw_cmd_kd_[i] != configured_kd_[i];
+    hw_cmd_kp_[i] = configured_kp_[i];
+    hw_cmd_kd_[i] = configured_kd_[i];
+  }
+  gains_restored_.store(changed, std::memory_order_relaxed);
+}
+
 void RobstrideHardware::FinishTorqueRequest(TorqueResult result, size_t index, uint64_t now_ns)
 {
   const auto transition = torque_transition_;
@@ -1623,6 +1642,7 @@ void RobstrideHardware::ApplyTorqueRequest(uint64_t now_ns)
     measured_hold_->Engage(hw_state_position_, hw_cmd_position_, hw_cmd_velocity_);
     relaxed_state_.store(false, std::memory_order_relaxed);
     SeedMeasuredCommands();
+    RestoreConfiguredGains();
     torque_enabled_desired_.store(true, std::memory_order_relaxed);
     std::fill(seen_enabled_.begin(), seen_enabled_.end(), false);
     std::fill(last_recovery_ns_.begin(), last_recovery_ns_.end(), 0);
@@ -1735,6 +1755,9 @@ bool RobstrideHardware::RequestTorque(TorqueOperation operation, std::string & m
             "'; ";
         } else {
           text << "Engaged measured-pose hold; ";
+          if (gains_restored_.exchange(false, std::memory_order_relaxed)) {
+            text << "restored configured kp/kd; ";
+          }
         }
         text << "all " << joints_.size() << " joints confirmed; elapsed_ms=" <<
           torque_result_ms_.load() << "; max_step_rad=" << std::setprecision(6) <<
